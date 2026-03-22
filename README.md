@@ -1,53 +1,142 @@
-[English](README.md) | [中文](README.zh.md) | [日本語](README.ja.md)  
-# claw0
+[English](README.md) | [中文](README.zh.md) | [日本語](README.ja.md)
 
+# claw0 / tinyClaw
 
 **From Zero to One: Build an AI Agent Gateway**
 
 > 10 progressive sections -- every section is a single, runnable Python file.
 > 3 languages (English, Chinese, Japanese) -- code + docs co-located.
+> Production project structure under `src/tinyclaw/` -- ready to use.
 
 ---
 
-## What is this?
+## Two Parts
 
-Most agent tutorials stop at "call an API once." This repository starts from that while loop and takes you all the way to a production-grade gateway.
+This repository has two parallel structures:
 
-Build a minimal AI agent gateway from scratch, section by section. 10 sections, 10 core concepts, ~7,000 lines of Python. Each section introduces exactly one new idea while keeping all prior code intact. After all 10, you can read OpenClaw's production codebase with confidence.
+### 1. `sessions/` - Learning Path (教学路径)
+
+10 progressive teaching files, each adding exactly one new concept.
+Run any section directly:
 
 ```sh
-s01: Agent Loop           -- The foundation: while + stop_reason
-s02: Tool Use             -- Let the model call tools: dispatch table
-s03: Sessions & Context   -- Persist conversations, handle overflow
-s04: Channels             -- Telegram + Feishu: real channel pipelines
-s05: Gateway & Routing    -- 5-tier binding, session isolation
-s06: Intelligence         -- Soul, memory, skills, prompt assembly
-s07: Heartbeat & Cron     -- Proactive agent + scheduled tasks
-s08: Delivery             -- Reliable message queue with backoff
-s09: Resilience           -- 3-layer retry onion + auth profile rotation
-s10: Concurrency          -- Named lanes serialize the chaos
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env: set ANTHROPIC_API_KEY
+
+python sessions/zh/s01_agent_loop.py    # Agent Loop
+python sessions/zh/s02_tool_use.py     # + Tool Use
+python sessions/zh/s03_sessions.py      # + Sessions
+python sessions/zh/s04_channels.py     # + Channels
+python sessions/zh/s05_gateway_routing.py  # + Gateway
+python sessions/zh/s06_intelligence.py  # + Intelligence
+python sessions/zh/s07_heartbeat_cron.py  # + Heartbeat & Cron
+python sessions/zh/s08_delivery.py     # + Delivery
+python sessions/zh/s09_resilience.py   # + Resilience
+python sessions/zh/s10_concurrency.py  # + Concurrency
 ```
 
-## Architecture
+### 2. `src/tinyclaw/` - Production Project (生产项目)
+
+After completing the learning path, the production-ready project is organized under `src/tinyclaw/`:
 
 ```
-+------------------- claw0 layers -------------------+
-|                                                     |
-|  s10: Concurrency  (named lanes, generation track)  |
-|  s09: Resilience   (auth rotation, overflow compact)|
-|  s08: Delivery     (write-ahead queue, backoff)     |
-|  s07: Heartbeat    (lane lock, cron scheduler)      |
-|  s06: Intelligence (8-layer prompt, hybrid memory)  |
-|  s05: Gateway      (WebSocket, 5-tier routing)      |
-|  s04: Channels     (Telegram pipeline, Feishu hook) |
-|  s03: Sessions     (JSONL persistence, 3-stage retry)|
-|  s02: Tools        (dispatch table, 4 tools)        |
-|  s01: Agent Loop   (while True + stop_reason)       |
-|                                                     |
-+-----------------------------------------------------+
+src/tinyclaw/
+├── config.py          # 配置加载 (.env)
+├── client.py          # Anthropic client 工厂
+├── utils/             # 工具函数
+├── agent/             # Agent 循环 + 工具分发
+├── session/           # 会话持久化 + 上下文保护
+├── channel/           # 渠道适配器 (CLI/Telegram/Feishu)
+├── gateway/           # 5层路由 + WebSocket 网关
+├── intelligence/      # Soul/Memory/Skills/8层 Prompt
+├── scheduler/         # 心跳 + Cron
+├── delivery/          # WAL 投递队列
+├── resilience/        # 3层重试 + Auth 轮换
+└── concurrency/       # 命名 Lane
 ```
 
-## Section Dependencies
+---
+
+## Quick Start (Production Project)
+
+```sh
+# 安装
+pip install -e .
+# 或
+pip install -r requirements.txt
+
+# 配置
+cp .env.example .env
+# 编辑 .env:
+#   ANTHROPIC_API_KEY=sk-ant-xxxxx
+#   MODEL_ID=claude-sonnet-4-20250514
+
+# 运行
+python main.py --help
+
+# 三种模式:
+python main.py --mode cli      # 简单 REPL 对话
+python main.py --mode full     # 全功能模式 (心跳 + cron + 投递 + 并发)
+python main.py --mode gateway   # WebSocket 网关 (默认端口 8765)
+```
+
+### Full Mode Features
+
+- Named lanes (main/cron/heartbeat) with FIFO queues
+- Write-ahead log delivery queue with exponential backoff
+- 3-layer retry: auth rotation → overflow compact → tool-use loop
+- Heartbeat proactive checks during active hours
+- Cron scheduler (at/every/cron expressions)
+- Hybrid memory search (TF-IDF + simulated vector)
+- 8-layer system prompt assembly
+- Skills discovery from workspace directories
+
+### Gateway Mode
+
+```sh
+# 启动 WebSocket 网关
+python main.py --mode gateway --port 8765
+
+# JSON-RPC 2.0 接口:
+# ws://localhost:8765
+
+# 发送消息:
+{"jsonrpc": "2.0", "method": "send", "params": {"text": "Hello!"}, "id": 1}
+
+# 列出 agents:
+{"jsonrpc": "2.0", "method": "agents.list", "params": {}, "id": 2}
+
+# 查看路由 bindings:
+{"jsonrpc": "2.0", "method": "bindings.list", "params": {}, "id": 3}
+```
+
+---
+
+## Architecture (Production)
+
+```
+tinyClaw
+├── agent/        while True + stop_reason (Agent Loop)
+│                 schema + handler (Tool Dispatcher)
+├── session/      JSONL persistence (Session Store)
+│                 3-stage overflow (Context Guard)
+├── channel/      InboundMessage abstraction (base)
+│                 Telegram long-polling / Feishu webhooks
+├── gateway/      5-tier binding table (routing)
+│                 WebSocket + JSON-RPC 2.0 (server)
+├── intelligence/ soul / memory / skills / 8-layer prompt
+├── scheduler/    Heartbeat (proactive checks)
+│                 Cron (at/every/cron expressions)
+├── delivery/     WAL queue + background runner
+├── resilience/   Auth profile rotation
+│                 3-layer retry onion
+└── concurrency/  Named FIFO lanes (generation tracking)
+```
+
+---
+
+## Section Dependencies (Learning Path)
 
 ```
 s01 --> s02 --> s03 --> s04 --> s05
@@ -59,97 +148,94 @@ s01 --> s02 --> s03 --> s04 --> s05
                 s09 ----------> s10
 ```
 
-- s01-s02: Foundation (no dependencies)
-- s03: Builds on s02 (adds persistence to the tool loop)
-- s04: Builds on s03 (channels produce InboundMessages for sessions)
-- s05: Builds on s04 (routes channel messages to agents)
-- s06: Builds on s03 (uses sessions for context, adds prompt layers)
-- s07: Builds on s06 (heartbeat uses soul/memory for prompt)
-- s08: Builds on s07 (heartbeat output flows through delivery queue)
-- s09: Builds on s03+s06 (reuses ContextGuard for overflow, model config)
-- s10: Builds on s07 (replaces single Lock with named lane system)
+---
 
-## Quick Start
+## Configuration
+
+`.env` 配置文件:
 
 ```sh
-# 1. Clone and enter
-git clone https://github.com/shareAI-lab/claw0.git && cd claw0
+# LLM (必需)
+ANTHROPIC_API_KEY=sk-ant-xxxxx
+MODEL_ID=claude-sonnet-4-20250514
 
-# 2. Install dependencies
-pip install -r requirements.txt
+# 可选: 自定义 API 端点 (OpenRouter 等)
+# ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
 
-# 3. Configure
-cp .env.example .env
-# Edit .env: set ANTHROPIC_API_KEY and MODEL_ID
+# Telegram (可选)
+# TELEGRAM_BOT_TOKEN=123456:ABC-DEF
+# TELEGRAM_ALLOWED_CHATS=12345,67890
 
-# 4. Run any section (pick your language)
-python sessions/en/s01_agent_loop.py    # English
-python sessions/zh/s01_agent_loop.py    # Chinese
-python sessions/ja/s01_agent_loop.py    # Japanese
+# Feishu/Lark (可选)
+# FEISHU_APP_ID=cli_xxxxxxxx
+# FEISHU_APP_SECRET=xxxxxxxx
+# FEISHU_IS_LARK=true
+
+# 心跳 (可选)
+# HEARTBEAT_INTERVAL=1800
+# HEARTBEAT_ACTIVE_START=9
+# HEARTBEAT_ACTIVE_END=22
 ```
 
-## Learning Path
+---
 
-Each section adds exactly one new concept. All prior code stays intact:
+## Workspace Files
 
-```
-Phase 1: FOUNDATION     Phase 2: CONNECTIVITY     Phase 3: BRAIN        Phase 4: AUTONOMY       Phase 5: PRODUCTION
-+----------------+      +-------------------+     +-----------------+   +-----------------+   +-----------------+
-| s01: Loop      |      | s03: Sessions     |     | s06: Intelligence|  | s07: Heartbeat  |   | s09: Resilience |
-| s02: Tools     | ---> | s04: Channels     | --> |   soul, memory, | ->|   & Cron        |-->|   & Concurrency |
-|                |      | s05: Gateway      |     |   skills, prompt |  | s08: Delivery   |   | s10: Lanes      |
-+----------------+      +-------------------+     +-----------------+   +-----------------+   +-----------------+
- while + dispatch        persist + route            personality + recall  proactive + reliable  retry + serialize
-```
+工作区文件位于 `workspace/`:
 
-## Section Details
+| 文件 | 用途 |
+|------|------|
+| `SOUL.md` | Agent 个性/灵魂定义 |
+| `IDENTITY.md` | Agent 身份描述 |
+| `TOOLS.md` | 工具使用指南 |
+| `MEMORY.md` | 长期记忆 (常青内容) |
+| `HEARTBEAT.md` | 心跳检查指令 |
+| `BOOTSTRAP.md` | 启动时加载的提示 |
+| `CRON.json` | Cron 任务配置 |
+| `skills/` | Skill 技能目录 |
 
-| # | Section | Core Concept | Lines |
-|---|---------|-------------|-------|
-| 01 | Agent Loop | `while True` + `stop_reason` -- that's an agent | ~175 |
-| 02 | Tool Use | Tools = schema dict + handler map. Model picks a name, you look it up | ~445 |
-| 03 | Sessions | JSONL: append on write, replay on read. Too big? Summarize old parts | ~890 |
-| 04 | Channels | Every platform differs, but they all produce the same `InboundMessage` | ~780 |
-| 05 | Gateway | Binding table maps (channel, peer) to agent. Most specific wins | ~625 |
-| 06 | Intelligence | System prompt = files on disk. Swap files, change personality | ~750 |
-| 07 | Heartbeat & Cron | Timer thread: "should I run?" + queue work alongside user messages | ~660 |
-| 08 | Delivery | Write to disk first, then send. Crashes can't lose messages | ~870 |
-| 09 | Resilience | 3-layer retry onion: auth rotation, overflow compaction, tool-use loop | ~1130 |
-| 10 | Concurrency | Named lanes with FIFO queues, generation tracking, Future-based results | ~900 |
+---
 
 ## Repository Structure
 
 ```
-claw0/
-  README.md              English README
-  README.zh.md           Chinese README
-  README.ja.md           Japanese README
-  .env.example           Configuration template
-  requirements.txt       Python dependencies
-  sessions/              All teaching sessions (code + docs)
-    en/                  English
-      s01_agent_loop.py  s01_agent_loop.md
-      s02_tool_use.py    s02_tool_use.md
-      ...                (10 .py + 10 .md)
-    zh/                  Chinese
-      s01_agent_loop.py  s01_agent_loop.md
-      ...                (10 .py + 10 .md)
-    ja/                  Japanese
-      s01_agent_loop.py  s01_agent_loop.md
-      ...                (10 .py + 10 .md)
-  workspace/             Shared workspace samples
-    SOUL.md  IDENTITY.md  TOOLS.md  USER.md
-    HEARTBEAT.md  BOOTSTRAP.md  AGENTS.md  MEMORY.md
-    CRON.json
-    skills/example-skill/SKILL.md
+tinyClaw/
+├── README.md              # This file
+├── .env.example           # Configuration template
+├── requirements.txt        # Python dependencies
+├── pyproject.toml         # Package configuration
+├── main.py                # Production CLI entry point
+├── src/tinyclaw/          # Production project (按功能模块划分)
+│   ├── __init__.py
+│   ├── config.py
+│   ├── client.py
+│   ├── utils/
+│   ├── agent/
+│   ├── session/
+│   ├── channel/
+│   ├── gateway/
+│   ├── intelligence/
+│   ├── scheduler/
+│   ├── delivery/
+│   ├── resilience/
+│   └── concurrency/
+├── sessions/               # Learning path (教学代码, 保留原有结构)
+│   ├── en/                # English
+│   ├── zh/                # 中文
+│   └── ja/                # 日本語
+└── workspace/              # Agent 工作区
+    ├── SOUL.md
+    ├── TOOLS.md
+    ├── skills/
+    └── ...
 ```
 
-Each language folder is self-contained: runnable Python code + documentation side by side. Code logic is identical across languages; comments and docs differ.
+---
 
 ## Prerequisites
 
-- Python 3.11+
-- An API key for Anthropic (or compatible provider)
+- Python 3.10+
+- An API key for Anthropic (or compatible provider via `ANTHROPIC_BASE_URL`)
 
 ## Dependencies
 
@@ -158,19 +244,10 @@ anthropic>=0.39.0
 python-dotenv>=1.0.0
 websockets>=12.0
 croniter>=2.0.0
-python-telegram-bot>=21.0
 httpx>=0.27.0
 ```
 
-## Related Projects
-
-- **[learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)** -- A companion teaching repo that builds an agent **framework** (nano Claude Code) from scratch in 12 progressive sessions. Where claw0 focuses on gateway routing, channels, and proactive behavior, learn-claude-code dives deep into the agent's internal design: structured planning (TodoManager + nag), context compression (3-layer compact), file-based task persistence with dependency graphs, team coordination (JSONL mailboxes, shutdown/plan-approval FSM), autonomous self-organization, and git worktree isolation for parallel execution. If you want to understand how a production-grade unit agent works inside, start there.
-
-## About
-<img width="260" src="https://github.com/user-attachments/assets/fe8b852b-97da-4061-a467-9694906b5edf" /><br>
-
-Scan with Wechat to fellow us,  
-or fellow on X: [shareAI-Lab](https://x.com/baicai003)  
+---
 
 ## License
 
