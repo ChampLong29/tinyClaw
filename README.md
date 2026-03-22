@@ -16,7 +16,7 @@
 10 个递进式教学文件，每章增加一个核心概念：
 
 ```sh
-pip install -r requirements.txt
+uv sync
 cp .env.example .env
 # 编辑 .env: 设置 ANTHROPIC_API_KEY
 
@@ -57,10 +57,8 @@ src/tinyclaw/
 ## 快速开始 (生产项目)
 
 ```sh
-# 安装依赖
-pip install -e .
-# 或
-pip install -r requirements.txt
+# 使用 uv 构建环境
+uv sync
 
 # 配置
 cp .env.example .env

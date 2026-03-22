@@ -13,10 +13,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+telegram = ["python-telegram-bot>=21.0"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",
 ]
+
+[project.scripts]
+tinyclaw = "tinyclaw.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -32,3 +36,9 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 ignore = ["E501"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
