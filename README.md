@@ -316,11 +316,12 @@ invocation: /中文技能
 tinyClaw/
 ├── README.md              # 本文件
 ├── .env.example           # 配置模板
-├── requirements.txt       # Python 依赖
-├── pyproject.toml         # 包配置
-├── main.py                # 生产项目 CLI 入口
+├── pyproject.toml         # 包配置 + 依赖 (uv)
+├── uv.lock                # 锁定依赖版本
+├── main.py                # CLI 入口
 ├── src/tinyclaw/          # 生产级代码 (按功能模块划分)
 │   ├── __init__.py
+│   ├── __main__.py        # 支持 python -m tinyclaw
 │   ├── config.py
 │   ├── client.py
 │   ├── utils/
@@ -351,15 +352,26 @@ tinyClaw/
 - Python 3.10+
 - Anthropic API Key (或通过 `ANTHROPIC_BASE_URL` 配置兼容端点)
 
-## 依赖
+## 环境要求
 
+- Python 3.10+
+- [uv](https://github.com/astral-sh/uv) (推荐) 或 pip
+- Anthropic API Key (或通过 `ANTHROPIC_BASE_URL` 配置兼容端点)
+
+## 依赖 (pyproject.toml)
+
+```sh
+# 使用 uv (推荐)
+uv sync
+
+# 开发依赖
+uv sync --extra dev
+
+# Telegram 支持 (可选)
+uv sync --extra telegram
 ```
-anthropic>=0.39.0
-python-dotenv>=1.0.0
-websockets>=12.0
-croniter>=2.0.0
-httpx>=0.27.0
-```
+
+核心依赖：anthropic, python-dotenv, websockets, croniter, httpx
 
 ---
 

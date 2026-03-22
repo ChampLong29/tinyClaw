@@ -4,6 +4,11 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pdm-build/
+
+# uv
+uv.lock
+.python-version
 
 # Environment
 .env
