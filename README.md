@@ -166,14 +166,14 @@ s01 --> s02 --> s03 --> s04 --> s05
 ANTHROPIC_API_KEY=sk-ant-xxxxx
 MODEL_ID=claude-sonnet-4-20250514
 
-# 可选: 自定义 API 端点 (OpenRouter 等)
+# 自定义 API 端点 (可选，见下方「第三方 API 接入」)
 # ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
 
 # Telegram (可选)
 # TELEGRAM_BOT_TOKEN=123456:ABC-DEF
 # TELEGRAM_ALLOWED_CHATS=12345,67890
 
-# Feishu/Lark (可选)
+# Feishu/Lark (可选，见下方「飞书接入」)
 # FEISHU_APP_ID=cli_xxxxxxxx
 # FEISHU_APP_SECRET=xxxxxxxx
 # FEISHU_IS_LARK=true
@@ -183,6 +183,113 @@ MODEL_ID=claude-sonnet-4-20250514
 # HEARTBEAT_ACTIVE_START=9
 # HEARTBEAT_ACTIVE_END=22
 ```
+
+---
+
+## 第三方 API 接入
+
+支持接入任何兼容 Anthropic `messages.create()` 格式的 API 提供商，通过 `ANTHROPIC_BASE_URL` 配置：
+
+### OpenRouter
+
+```sh
+ANTHROPIC_API_KEY=sk-or-v1-xxxxx
+ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
+MODEL_ID=anthropic/claude-3.5-sonnet
+```
+
+### Groq
+
+```sh
+ANTHROPIC_API_KEY=gsk_xxxxx
+ANTHROPIC_BASE_URL=https://api.groq.com/openai/v1
+MODEL_ID=llama-3.1-70b-versatile
+```
+
+### 其他兼容厂商
+
+只要支持以下格式即可无需修改代码：
+- `POST /v1/messages` 接口
+- `messages.create(model=, system=, messages=, tools=, max_tokens=)`
+- `stop_reason` 包含 `end_turn` 或 `tool_use`
+
+---
+
+## 飞书接入
+
+### Step 1: 创建飞书应用
+
+1. 打开 [飞书开放平台](https://open.feishu.cn/app) → 创建「企业自建应用」
+2. 在「添加应用能力」中选择「机器人」
+3. 在「凭证与基础信息」获取 `App ID` 和 `App Secret`
+
+### Step 2: 配置事件订阅
+
+1. 进入「事件订阅」→ 启用「使用长连接接收事件」（简化部署）
+2. 添加事件：`im.message.receive_v1`（接收消息）
+3. 添加权限：`im:message`（读取消息）
+
+### Step 3: 配置环境变量
+
+```sh
+# .env
+FEISHU_APP_ID=cli_xxxxxxxx
+FEISHU_APP_SECRET=xxxxxxxx
+FEISHU_IS_LARK=false   # true = Lark 国际版, false = 飞书
+```
+
+### Step 4: 运行
+
+```sh
+python main.py --mode full
+```
+
+### 本地测试（需要公网回调）
+
+飞书需要公网可访问的回调 URL，本地测试推荐使用 ngrok：
+
+```sh
+# 安装 ngrok 后
+ngrok http 8765
+
+# 将返回的 https://xxx.ngrok.io 配置到飞书的事件订阅 URL
+# 并在飞书配置请求验证（如果需要）
+```
+
+---
+
+## Skills 与中文支持
+
+`workspace/skills/` 目录下的技能文件会被加载到 Agent 的 System Prompt 中。
+
+### 中文环境优化
+
+建议在 `workspace/IDENTITY.md` 中明确指示 Agent 使用中文：
+
+```markdown
+你是一个友善、有帮助的 AI 助手。
+请始终使用中文回复。
+```
+
+### 创建中文 Skills
+
+在 `workspace/skills/` 下创建目录，放入 `SKILL.md`：
+
+```markdown
+---
+name: 中文技能
+description: 一个中文技能示例
+invocation: /中文技能
+---
+# 中文技能说明
+
+当用户调用此技能时，按以下方式执行...
+```
+
+### 注意事项
+
+- Skills 文件内容会被直接注入 System Prompt，确保中文编码为 UTF-8
+- `skills/example-skill/SKILL.md` 为占位示例，可替换或删除
 
 ---
 
