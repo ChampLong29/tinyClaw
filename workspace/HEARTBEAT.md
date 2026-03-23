@@ -1,16 +1,16 @@
-# Heartbeat Instructions
+# 心跳检查指令
 
-Check the following items and report ONLY if something needs attention.
+检查以下项目，仅在需要关注时才报告。
 
-## Check Items
+## 检查项目
 
-1. **Pending Reminders**: Are there any reminders set by the user that are now due?
-2. **Daily Summary**: If it's after 6 PM and no daily summary was sent today, prepare a brief one.
-3. **Follow-ups**: Are there any topics from recent conversations that deserve a follow-up?
+1. **待处理提醒**: 用户设置的提醒中是否有已到期的？
+2. **每日总结**: 如果现在是下午 6 点之后，且今天还未发送每日总结，准备一份简短的总结。
+3. **跟进事项**: 最近对话中是否有值得跟进的话题？
 
-## Response Rules
+## 响应规则
 
-- If nothing needs attention, respond with exactly: HEARTBEAT_OK
-- If something needs reporting, be concise and actionable.
-- Never start with "I checked..." or "During my heartbeat..." -- just report the findings naturally.
-- Prioritize urgency: reminders > follow-ups > summaries.
+- 如果没有需要关注的事项，回复：`HEARTBEAT_OK`
+- 如果有需要报告的内容，请简洁且可操作。
+- 不要以「我检查了...」或「在我的心跳检查中...」开头 -- 自然地报告即可。
+- 按优先级排序：提醒 > 跟进 > 总结。
