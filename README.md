@@ -69,13 +69,19 @@ cp .env.example .env
 # 查看帮助
 python main.py --help
 
-# 三种运行模式:
-python main.py --mode cli       # 简单 REPL 对话
-python main.py --mode full      # 全功能模式 (心跳 + cron + 投递 + 并发)
-python main.py --mode gateway   # WebSocket 网关 (默认端口 8765)
+# 两个运行入口:
+python main.py --mode cli                  # 纯 CLI 交互
+python main.py --mode server               # 飞书/网关服务模式
+python main.py --mode server --port 8877   # 自定义 Gateway 端口
 ```
 
-### Full 模式特性
+### CLI 模式特性
+
+- 本地 REPL 对话
+- 命令查看系统状态（/status /cron /queue /lanes）
+- 适合本地调试与演示
+
+### Server 模式特性
 
 - 命名 Lane (main / cron / heartbeat)，FIFO 队列
 - WAL 写前日志投递队列，指数退避重试
@@ -86,11 +92,11 @@ python main.py --mode gateway   # WebSocket 网关 (默认端口 8765)
 - 8 层 System Prompt 动态组装
 - Skills 技能发现
 
-### Gateway 模式
+### Gateway API
 
 ```sh
-# 启动 WebSocket 网关
-python main.py --mode gateway --port 8765
+# 启动服务模式并暴露 WebSocket 网关
+python main.py --mode server --port 8765
 
 # JSON-RPC 2.0 接口:
 # ws://localhost:8765
@@ -234,24 +240,37 @@ MODEL_ID=llama-3.1-70b-versatile
 FEISHU_APP_ID=cli_xxxxxxxx
 FEISHU_APP_SECRET=xxxxxxxx
 FEISHU_IS_LARK=false   # true = Lark 国际版, false = 飞书
+FEISHU_MODE=long       # long | webhook | both | off
+
+# 仅 webhook/both 需要
+FEISHU_WEBHOOK_HOST=0.0.0.0
+FEISHU_WEBHOOK_PORT=8766
+FEISHU_WEBHOOK_PATH=/feishu/events
 ```
 
 ### Step 4: 运行
 
 ```sh
-python main.py --mode full
+# 长连接（无需 ngrok）
+python main.py --mode server
+
+# webhook（需要公网回调，可配 ngrok）
+# FEISHU_MODE=webhook 或 both
+python main.py --mode server
 ```
 
-### 本地测试（需要公网回调）
+飞书长连接模式无需 ngrok，飞书 SDK 会主动连接到飞书服务器。
 
-飞书需要公网可访问的回调 URL，本地测试推荐使用 ngrok：
+当使用 webhook/both 时，本地测试可用 ngrok：
 
 ```sh
-# 安装 ngrok 后
-ngrok http 8765
+ngrok http 8766
+```
 
-# 将返回的 https://xxx.ngrok.io 配置到飞书的事件订阅 URL
-# 并在飞书配置请求验证（如果需要）
+然后在飞书事件订阅中配置：
+
+```text
+https://<your-ngrok-domain>/feishu/events
 ```
 
 ---

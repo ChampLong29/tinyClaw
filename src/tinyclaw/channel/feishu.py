@@ -1,13 +1,19 @@
-"""Feishu (Lark) channel adapter using webhook callbacks."""
+"""Feishu (Lark) channel adapters.
+
+- FeishuChannel: webhook callbacks (requires external HTTP server)
+- FeishuLongConnectionChannel: long-connection via lark-oapi WS client (no ngrok)
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import queue
+import threading
 import time
 from typing import Any
 
-from tinyclaw.channel.base import Channel, InboundMessage, ChannelAccount
-from tinyclaw.utils.ansi import RED
+from tinyclaw.channel.base import AsyncChannel, Channel, InboundMessage, ChannelAccount
 
 try:
     import httpx
@@ -152,3 +158,212 @@ class FeishuChannel(Channel):
 
     def close(self) -> None:
         self._http.close()
+
+
+# ---------------------------------------------------------------------------
+# FeishuLongConnectionChannel -- lark-oapi WebSocket long connection
+# ---------------------------------------------------------------------------
+
+
+class FeishuLongConnectionChannel(AsyncChannel):
+    """Feishu long-connection channel via lark-oapi WS client.
+
+    Runs in its own background thread with its own event loop, bridging
+    incoming push events into an async queue. No ngrok or public URL needed.
+
+    Usage:
+        ch = FeishuLongConnectionChannel(
+            account=ChannelAccount(...),
+            gw_event_loop=loop,       # gateway's running event loop
+            gw_send_fn=send_fn,       # async fn(peer_id, text) called by gateway
+        )
+        await ch.start()              # start background thread
+        async for msg in ch.receive_all():
+            # msg is InboundMessage -- gateway routes and processes it
+            ...
+        ch.close()
+
+    The channel implements AsyncChannel: receive_all() yields InboundMessage,
+    and send() uses the HTTP API. The gateway owns the routing logic.
+    """
+
+    name = "feishu"
+
+    def __init__(
+        self,
+        account: ChannelAccount,
+        gw_event_loop_getter,  # callable -> asyncio.AbstractEventLoop
+        gw_send_fn,           # async (peer_id, text) -> None
+    ) -> None:
+        self.account_id = account.account_id
+        self.app_id = account.config.get("app_id", "")
+        self.app_secret = account.config.get("app_secret", "")
+        self._bot_open_id = account.config.get("bot_open_id", "")
+        is_lark = account.config.get("is_lark", False)
+        self.api_base = ("https://open.larksuite.com/open-apis" if is_lark
+                         else "https://open.feishu.cn/open-apis")
+        self._gw_loop_getter = gw_event_loop_getter
+        self._gw_send = gw_send_fn
+
+        self._tenant_token: str = ""
+        self._token_expires_at: float = 0.0
+        self._http = httpx.Client(timeout=15.0)
+
+        self._thread: threading.Thread | None = None
+        self._msg_queue: queue.Queue = queue.Queue()
+        self._running = False
+        self._closed = False
+
+    def start(self) -> None:
+        """Start the WS connection in a background thread."""
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="feishu-ws")
+        self._thread.start()
+
+    def _run(self) -> None:
+        """Background thread: sets up lark-oapi WS client in its own event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # All lark_oapi imports must happen here (before gateway's asyncio.run()
+        # starts). Otherwise the module-level get_event_loop() captures the
+        # running gateway loop.
+        from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+        from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+
+        def on_message_receive(event):
+            try:
+                msg_data = event.event
+                if not msg_data or not hasattr(msg_data, "message") or not msg_data.message:
+                    return
+
+                message = msg_data.message
+                msg_type = getattr(message, "message_type", "text")
+                raw_content = getattr(message, "content", "{}")
+
+                try:
+                    content = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+                except (json.JSONDecodeError, TypeError):
+                    content = {}
+
+                if msg_type != "text":
+                    return
+
+                text = content.get("text", "").strip()
+                if not text:
+                    return
+
+                sender = getattr(msg_data, "sender", None)
+                user_id = ""
+                if sender and hasattr(sender, "sender_id"):
+                    sid = sender.sender_id
+                    user_id = getattr(sid, "open_id", "") or getattr(sid, "user_id", "")
+
+                chat_type = getattr(message, "chat_type", "p2p")
+                peer_id = getattr(message, "chat_id", user_id)
+                is_group = chat_type == "group"
+
+                if user_id == self._bot_open_id:
+                    return
+
+                # Yield as InboundMessage for ChannelManager to pick up
+                self._msg_queue.put(InboundMessage(
+                    text=text, sender_id=user_id,
+                    channel="feishu", account_id=self.account_id,
+                    peer_id=peer_id, is_group=is_group,
+                ))
+
+                # Also delegate send to gateway's event loop
+                async def _deliver():
+                    await self._gw_send(peer_id, text)
+
+                gw_loop = self._gw_loop_getter()
+                if gw_loop and gw_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(_deliver(), gw_loop)
+
+            except Exception as exc:
+                print(f"[feishu] 处理消息异常: {exc}")
+
+        class _Processor:
+            def __init__(self, cb):
+                self._cb = cb
+                self._type = P2ImMessageReceiveV1
+
+            def type(self):
+                return self._type
+
+            def do(self, data):
+                self._cb(data)
+                return None
+
+        handler = EventDispatcherHandler()
+        handler._processorMap["p2.im.message.receive_v1"] = _Processor(on_message_receive)
+
+        from lark_oapi.ws import Client as FeishuWSClient
+        domain = ("https://open.feishu.cn"
+                  if self.api_base == "https://open.feishu.cn/open-apis"
+                  else "https://open.larksuite.com")
+        ws_client = FeishuWSClient(
+            app_id=self.app_id,
+            app_secret=self.app_secret,
+            event_handler=handler,
+            domain=domain,
+            auto_reconnect=True,
+        )
+
+        print(f"[gateway] 飞书长连接已启动（无需 ngrok）")
+        ws_client.start()
+
+    def _refresh_token(self) -> str:
+        if self._tenant_token and time.time() < self._token_expires_at:
+            return self._tenant_token
+        try:
+            resp = self._http.post(
+                f"{self.api_base}/auth/v3/tenant_access_token/internal",
+                json={"app_id": self.app_id, "app_secret": self.app_secret},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                return ""
+            self._tenant_token = data.get("tenant_access_token", "")
+            self._token_expires_at = time.time() + data.get("expire", 7200) - 300
+            return self._tenant_token
+        except Exception:
+            return ""
+
+    def send(self, to: str, text: str, **kwargs) -> bool:
+        token = self._refresh_token()
+        if not token:
+            return False
+        try:
+            resp = self._http.post(
+                f"{self.api_base}/im/v1/messages",
+                params={"receive_id_type": "chat_id"},
+                headers={"Authorization": f"Bearer {token}"},
+                json={"receive_id": to, "msg_type": "text",
+                      "content": json.dumps({"text": text})},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                return False
+            return True
+        except Exception:
+            return False
+
+    async def receive_all(self):
+        """Async iterator: yields InboundMessage as they arrive."""
+        while self._running and not self._closed:
+            try:
+                # Avoid blocking the gateway event loop thread.
+                msg = await asyncio.to_thread(self._msg_queue.get, True, 0.5)
+                yield msg
+            except queue.Empty:
+                continue
+
+    def close(self) -> None:
+        self._running = False
+        self._closed = True
+        self._http.close()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+

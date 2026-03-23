@@ -6,6 +6,8 @@ Agent loop only sees InboundMessage -- platform differences are encapsulated.
 
 from __future__ import annotations
 
+import asyncio
+import queue
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -53,22 +55,81 @@ class Channel(ABC):
         pass
 
 
+class AsyncChannel(ABC):
+    """Async variant of Channel for gateway mode.
+
+    Channels that receive messages via push (e.g. Feishu long connection,
+    WebSocket) implement receive_all() as an async iterator instead of
+    blocking receive().
+    """
+
+    name: str = "unknown"
+
+    @abstractmethod
+    async def receive_all(self):
+        """Async iterator: yields InboundMessage as they arrive."""
+        ...
+
+    @abstractmethod
+    def send(self, to: str, text: str, **kwargs: Any) -> bool:
+        ...
+
+    def close(self) -> None:
+        pass
+
+
 class ChannelManager:
-    """Registry for channel instances."""
+    """Registry for channel instances (both sync and async)."""
 
     def __init__(self) -> None:
         self.channels: dict[str, Channel] = {}
+        self.async_channels: dict[str, AsyncChannel] = {}
         self.accounts: list[ChannelAccount] = []
 
     def register(self, channel: Channel) -> None:
         self.channels[channel.name] = channel
 
-    def list_channels(self) -> list[str]:
-        return list(self.channels.keys())
+    def register_async(self, channel: AsyncChannel) -> None:
+        self.async_channels[channel.name] = channel
 
-    def get(self, name: str) -> Channel | None:
-        return self.channels.get(name)
+    def list_channels(self) -> list[str]:
+        return list(set(self.channels) | set(self.async_channels))
+
+    def get(self, name: str) -> Channel | AsyncChannel | None:
+        return self.channels.get(name) or self.async_channels.get(name)
 
     def close_all(self) -> None:
         for ch in self.channels.values():
             ch.close()
+        for ch in self.async_channels.values():
+            ch.close()
+
+    async def receive_next(self, timeout: float = 0.5):
+        """Wait for the next message from any async channel."""
+        tasks = []
+        queues: dict[asyncio.Task, str] = {}
+
+        for name, ch in self.async_channels.items():
+            async def source(ch=ch):
+                async for msg in ch.receive_all():
+                    return msg
+                # If channel ends, return None
+                return None
+
+            task = asyncio.create_task(source())
+            tasks.append(task)
+            queues[task] = name
+
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            for t in done:
+                msg = t.result()
+                if msg is not None:
+                    return msg
+        except Exception:
+            for t in tasks:
+                t.cancel()
+        return None
+

@@ -116,10 +116,11 @@ def tool_edit_file(file_path: str, old_string: str, new_string: str, workdir: Pa
 
 
 def tool_get_current_time() -> str:
-    """Return current UTC time."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    """Return current Beijing time."""
+    from tinyclaw.utils.timezone import now_beijing
+
+    now = now_beijing()
+    return now.strftime("%Y-%m-%d %H:%M:%S CST")
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +187,7 @@ BUILTIN_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_current_time",
-        "description": "Get the current date and time in UTC.",
+        "description": "Get the current date and time in Beijing timezone.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
 ]

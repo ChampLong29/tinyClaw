@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from tinyclaw.utils.timezone import format_iso_to_beijing, now_beijing
+
 
 def run_agent_single_turn(
     prompt: str,
@@ -96,12 +98,13 @@ class HeartbeatRunner:
         if due_reminders:
             reminder_section = "\n\n## 到期提醒\n\n"
             for r in due_reminders:
-                reminder_section += f"- {r['content']} (到期时间: {r.get('due', '未知')})\n"
+                due_display = format_iso_to_beijing(r.get("due", ""), fmt="%Y-%m-%d %H:%M", empty="未知")
+                reminder_section += f"- {r['content']} (到期时间: {due_display})\n"
 
         extra = ""
         if mem_text:
             extra = f"## Known Context\n\n{mem_text}\n\n"
-        extra += f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        extra += f"Current time (Beijing): {now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
         if reminder_section:
             extra += reminder_section
         return instructions, soul.build_system_prompt(extra)

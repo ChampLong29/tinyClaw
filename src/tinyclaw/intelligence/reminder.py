@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
+
+from tinyclaw.utils.timezone import format_iso_to_beijing
 
 
 class ReminderStore:
@@ -19,21 +21,14 @@ class ReminderStore:
         self,
         content: str,
         due_time: datetime | None = None,
-        category: str = "reminder",
     ) -> str:
-        """Write a reminder. If due_time is None, assume it's a relative time."""
-        reminder_time = due_time or datetime.now(timezone.utc)
-
-        # Parse relative time from content if no due_time provided
-        due_str = ""
-        if due_time:
-            due_str = due_time.isoformat()
+        """Write a reminder with due time."""
+        due_str = due_time.isoformat() if due_time else ""
 
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "due": due_str,
             "content": content,
-            "category": category,
             "done": False,
         }
 
@@ -41,25 +36,24 @@ class ReminderStore:
         try:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            return f"已保存提醒：{content}" + (f"，到期时间 {due_str}" if due_str else "")
+            due_display = format_iso_to_beijing(due_str, fmt="%Y-%m-%d %H:%M", empty="")
+            return f"已保存提醒：{content}" + (f"，到期 {due_display}" if due_display else "")
         except Exception as exc:
-            return f"保存提醒失败: {exc}"
+            return f"保存失败: {exc}"
 
     def get_due_reminders(self) -> list[dict]:
-        """Get all reminders that are due (past their due time)."""
+        """Get reminders past their due time that haven't been alerted yet."""
         now = datetime.now(timezone.utc)
         reminders = []
-
         if not self.reminder_dir.is_dir():
             return reminders
-
         for f in sorted(self.reminder_dir.glob("*.jsonl")):
             try:
                 for line in f.read_text(encoding="utf-8").splitlines():
                     if not line.strip():
                         continue
                     entry = json.loads(line)
-                    if entry.get("done"):
+                    if entry.get("done") or entry.get("reminded"):
                         continue
                     due_str = entry.get("due", "")
                     if not due_str:
@@ -72,31 +66,67 @@ class ReminderStore:
                         continue
             except Exception:
                 continue
-
         return reminders
 
-    def mark_done(self, content: str) -> str:
-        """Mark a reminder as done by matching content."""
+    def get_all_reminders(self) -> list[dict]:
+        """Get all pending reminders."""
+        reminders = []
+        if not self.reminder_dir.is_dir():
+            return reminders
+        for f in sorted(self.reminder_dir.glob("*.jsonl")):
+            try:
+                for line in f.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    if not entry.get("done"):
+                        reminders.append(entry)
+            except Exception:
+                continue
+        return reminders
+
+    def mark_done(self, task_id: str) -> str:
+        """Mark a reminder as done (removes from list)."""
+        if not self.reminder_dir.is_dir():
+            return "没有提醒"
         now = datetime.now(timezone.utc)
         today_path = self.reminder_dir / f"{now.strftime('%Y%m%d')}.jsonl"
-
         if not today_path.exists():
-            return "未找到今日提醒"
-
-        lines = today_path.read_text(encoding="utf-8").splitlines()
+            return "没有找到今日提醒"
+        lines = []
         found = False
-        for line in lines:
+        for line in today_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             entry = json.loads(line)
-            if content.lower() in entry.get("content", "").lower():
+            if task_id and task_id in entry.get("content", ""):
                 entry["done"] = True
                 found = True
-
+            lines.append(entry)
         if found:
             with open(today_path, "w", encoding="utf-8") as f:
-                for entry in [json.loads(l) for l in lines if l.strip()]:
-                    if not entry.get("done"):
-                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            return f"已标记完成：{content}"
-        return "未找到匹配的提醒"
+                for e in lines:
+                    if not e.get("done"):
+                        f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            return "已标记完成"
+        return "未找到提醒"
+
+    def mark_reminded(self, ts: str) -> None:
+        """Mark a reminder as already alerted (prevents duplicate alerts)."""
+        if not self.reminder_dir.is_dir():
+            return
+        for f in sorted(self.reminder_dir.glob("*.jsonl")):
+            try:
+                lines = []
+                for line in f.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    if entry.get("ts") == ts:
+                        entry["reminded"] = True
+                    lines.append(entry)
+                with open(f, "w", encoding="utf-8") as out:
+                    for entry in lines:
+                        out.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception:
+                continue

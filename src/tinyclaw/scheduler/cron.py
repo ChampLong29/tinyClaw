@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from tinyclaw.utils.timezone import now_beijing
+
 try:
     from croniter import croniter
     HAS_CRONITER = True
@@ -147,7 +149,7 @@ class CronService:
                     from tinyclaw.scheduler.heartbeat import run_agent_single_turn
                     sys_prompt = (
                         "You are performing a scheduled background task. Be concise. "
-                        f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        f"Current time (Beijing): {now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
                     )
                     if self.client_factory:
                         output = run_agent_single_turn(
@@ -219,10 +221,10 @@ class CronService:
                 "enabled": j.enabled,
                 "kind": j.schedule_kind,
                 "errors": j.consecutive_errors,
-                "last_run": (datetime.fromtimestamp(j.last_run_at).isoformat()
-                             if j.last_run_at > 0 else "never"),
-                "next_run": (datetime.fromtimestamp(j.next_run_at).isoformat()
-                             if j.next_run_at > 0 else "n/a"),
+                "last_run": (datetime.fromtimestamp(j.last_run_at).strftime("%Y-%m-%d %H:%M")
+                             if j.last_run_at > 0 else "从未"),
+                "next_run": (datetime.fromtimestamp(j.next_run_at).strftime("%Y-%m-%d %H:%M")
+                             if j.next_run_at > 0 else "未计划"),
                 "next_in": round(nxt) if nxt is not None else None,
             })
         return result
