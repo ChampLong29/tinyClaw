@@ -82,15 +82,28 @@ class HeartbeatRunner:
         """Build heartbeat instructions and system prompt."""
         from tinyclaw.intelligence.soul import SoulSystem
         from tinyclaw.intelligence.memory import MemoryStore
+        from tinyclaw.intelligence.reminder import ReminderStore
 
         instructions = self.heartbeat_path.read_text(encoding="utf-8").strip()
         soul = SoulSystem(self.workspace)
         memory = MemoryStore(self.workspace)
+        reminder_store = ReminderStore(self.workspace)
         mem_text = memory.load_evergreen()
+
+        # Check for due reminders
+        due_reminders = reminder_store.get_due_reminders()
+        reminder_section = ""
+        if due_reminders:
+            reminder_section = "\n\n## 到期提醒\n\n"
+            for r in due_reminders:
+                reminder_section += f"- {r['content']} (到期时间: {r.get('due', '未知')})\n"
+
         extra = ""
         if mem_text:
             extra = f"## Known Context\n\n{mem_text}\n\n"
         extra += f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        if reminder_section:
+            extra += reminder_section
         return instructions, soul.build_system_prompt(extra)
 
     def _parse_response(self, response: str) -> str | None:

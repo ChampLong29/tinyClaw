@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""tinyClaw CLI entry point.
+"""tinyClaw CLI 入口。
 
-Assembles all modules into a production-ready agent gateway.
+将所有模块组装成生产级 AI Agent Gateway。
 
-Usage:
+用法:
     python main.py --help
     python main.py --mode full --workspace ./workspace
     python main.py --mode cli
     python main.py --mode gateway --port 8765
 
-Modules assembled:
-  - Agent loop + tool dispatcher (agent/)
-  - Session store + context guard (session/)
-  - Channel adapters (channel/)
-  - Gateway routing + WebSocket server (gateway/)
-  - Intelligence: soul, memory, skills, prompt builder (intelligence/)
-  - Scheduler: heartbeat + cron (scheduler/)
-  - Delivery: WAL queue + runner (delivery/)
-  - Resilience: 3-layer retry + auth rotation (resilience/)
-  - Concurrency: named lanes (concurrency/)
+模块:
+  - Agent 循环 + 工具分发 (agent/)
+  - 会话存储 + 上下文保护 (session/)
+  - 渠道适配器 (channel/)
+  - 网关路由 + WebSocket 服务器 (gateway/)
+  - 智能系统: soul, memory, skills, prompt builder (intelligence/)
+  - 调度器: heartbeat + cron (scheduler/)
+  - 投递: WAL 队列 + runner (delivery/)
+  - 容错: 3层重试 + Auth 轮换 (resilience/)
+  - 并发: 命名 Lane (concurrency/)
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ from tinyclaw.gateway.routing import build_session_key
 from tinyclaw.intelligence import (
     BootstrapLoader, SoulSystem, MemoryStore, SkillsManager, build_system_prompt,
 )
+from tinyclaw.intelligence.reminder import ReminderStore
 from tinyclaw.scheduler import HeartbeatRunner, CronService
 from tinyclaw.utils.ansi import (
     CYAN, GREEN, YELLOW, DIM, RESET, BOLD, print_assistant, print_info, print_warn,
@@ -65,24 +66,86 @@ def _create_client_factory(api_key: str, base_url: str | None):
     return factory
 
 
+def _parse_reminder_time(content: str) -> tuple[str, str | None, int | None]:
+    """解析时间表达式，如「一分钟后」或「明天上午10点」。"""
+    import re
+    from datetime import datetime, timezone, timedelta
+
+    # 匹配「一分钟后」「5分钟后」「半小时后」等模式
+    m = re.search(r"(\d+|半小?[时分秒]?)后", content)
+    minutes = None
+    if m:
+        unit = m.group(1)
+        if unit in ("秒", "秒后"):
+            minutes = 1 / 60
+        elif unit in ("分", "分钟后", "分后"):
+            minutes = int(re.search(r"\d+", content).group(0)) if re.search(r"\d+", content) else 1
+        elif unit in ("小?时", "小时后", "小时后"):
+            minutes = 60 * (int(re.search(r"\d+", content).group(0)) if re.search(r"\d+", content) else 1)
+        elif "半小" in unit:
+            minutes = 30
+        if minutes is not None:
+            # 从内容中移除时间表达式
+            cleaned = re.sub(r"\d+分?钟?后?", "", content).strip()
+            due = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            return cleaned, due.isoformat(), None
+
+    return content, None, None
+
+
+def _set_reminder(store, content: str, due_time: str | None, minutes_from_now: int | None) -> str:
+    """设置提醒。"""
+    from datetime import datetime, timezone, timedelta
+
+    due = None
+    if due_time:
+        try:
+            due = datetime.fromisoformat(due_time.replace("Z", "+00:00"))
+        except ValueError:
+            return f"时间格式错误，请使用 ISO 格式如 2024-01-15T10:00:00"
+    elif minutes_from_now:
+        due = datetime.now(timezone.utc) + timedelta(minutes=minutes_from_now)
+    else:
+        # 尝试从内容中解析时间
+        content, due_str, _ = _parse_reminder_time(content)
+        if due_str:
+            due = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+            return store.write_reminder(content, due)
+        return store.write_reminder(content)
+
+    return store.write_reminder(content, due)
+
+
+def _list_reminders(store) -> str:
+    """列出所有提醒。"""
+    due = store.get_due_reminders()
+    if not due:
+        return "没有待处理的提醒"
+    lines = ["待处理提醒："]
+    for r in due:
+        lines.append(f"- {r['content']} (到期: {r.get('due', '未知')})")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
-# REPL commands
+# REPL 命令
 # ---------------------------------------------------------------------------
 
 def print_help() -> None:
-    print_info("tinyClaw CLI commands:")
-    print_info("  /help     -- show this help")
-    print_info("  /status   -- show system status")
-    print_info("  /memory   -- show memory stats")
-    print_info("  /queue    -- show delivery queue stats")
-    print_info("  /lanes    -- show concurrency lane stats")
-    print_info("  /trigger  -- trigger heartbeat now")
-    print_info("  /cron     -- list cron jobs")
-    print_info("  quit/exit -- exit")
+    print_info("tinyClaw 命令:")
+    print_info("  /help     -- 显示帮助")
+    print_info("  /status   -- 显示系统状态")
+    print_info("  /memory   -- 显示记忆统计")
+    print_info("  /reminder -- 显示提醒列表")
+    print_info("  /queue    -- 显示投递队列状态")
+    print_info("  /lanes    -- 显示并发 Lane 状态")
+    print_info("  /trigger  -- 立即触发心跳")
+    print_info("  /cron     -- 列出定时任务")
+    print_info("  quit/exit -- 退出程序")
 
 
 # ---------------------------------------------------------------------------
-# Full mode: all features assembled
+# Full 模式: 集成所有功能
 # ---------------------------------------------------------------------------
 
 def run_full_mode(
@@ -103,7 +166,7 @@ def run_full_mode(
 
     bindings = BindingTable()
     mgr = AgentManager(workspace / ".agents")
-    mgr.register(AgentConfig(id="main", name="Luna", dm_scope="per-peer", model=model_id))
+    mgr.register(AgentConfig(id="main", name="小 Luna", dm_scope="per-peer", model=model_id))
 
     cmd_queue = CommandQueue()
     cmd_queue.get_or_create_lane(LANE_MAIN, max_concurrency=1)
@@ -111,25 +174,43 @@ def run_full_mode(
     cmd_queue.get_or_create_lane(LANE_HEARTBEAT, max_concurrency=1)
 
     queue = DeliveryQueue(workspace / "delivery-queue")
+    reminder_store = ReminderStore(workspace)
     dispatcher = ToolDispatcher()
     dispatcher.register_builtin(workdir=workspace)
     dispatcher.register({
         "name": "memory_write",
-        "description": "Save important facts to long-term memory.",
+        "description": "保存重要事实到长期记忆。",
         "input_schema": {"type": "object", "properties": {
-            "content": {"type": "string", "description": "The fact or preference to remember."}},
+            "content": {"type": "string", "description": "要记住的事实或偏好。"}},
             "required": ["content"]},
     }, lambda content="", **_: memory.write_memory(content))
     dispatcher.register({
         "name": "memory_search",
-        "description": "Search long-term memory for relevant information.",
+        "description": "搜索长期记忆中的相关信息。",
         "input_schema": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "Search query."}},
+            "query": {"type": "string", "description": "搜索关键词。"}},
             "required": ["query"]},
     }, lambda query="", **_: memory.hybrid_search(query))
+    dispatcher.register({
+        "name": "reminder_write",
+        "description": "设置提醒。用于用户请求提醒时调用。",
+        "input_schema": {"type": "object", "properties": {
+            "content": {"type": "string", "description": "提醒内容（要做什么）。"},
+            "due_time": {"type": "string", "description": "到期时间，ISO 格式（如 2024-01-15T10:00:00）。"},
+            "minutes_from_now": {"type": "integer", "description": "从现在起几分钟（作为 due_time 的替代）。"}},
+            "required": ["content"]},
+    }, lambda content="", due_time=None, minutes_from_now=None, **_: (
+        _set_reminder(reminder_store, content, due_time, minutes_from_now)
+    ))
+    dispatcher.register({
+        "name": "reminder_list",
+        "description": "列出所有待处理的提醒。",
+        "input_schema": {"type": "object", "properties": {}},
+    }, lambda **_: _list_reminders(reminder_store))
 
     def deliver_fn(ch: str, to: str, text: str) -> None:
-        print_info(f"  [delivery] {ch} -> {to}: {text[:60]}...")
+        # CLI 模式不需要打印投递日志，响应已直接显示
+        pass
 
     delivery_runner = DeliveryRunner(queue, deliver_fn)
     delivery_runner.start()
@@ -162,6 +243,26 @@ def run_full_mode(
             cron_stop.wait(timeout=1.0)
     threading.Thread(target=cron_loop, daemon=True, name="cron-tick").start()
 
+    # 提醒检查线程：每 60 秒检查一次到期提醒
+    def reminder_check_loop() -> None:
+        """定期检查到期提醒并输出。"""
+        last_checked: list = []
+        while True:
+            time.sleep(60)
+            try:
+                due = reminder_store.get_due_reminders()
+                new_due = [r for r in due if r not in last_checked]
+                if new_due:
+                    for r in new_due:
+                        print(f"\n{GREEN}{BOLD}[提醒] {RESET}{r['content']}")
+                    last_checked = due
+                else:
+                    last_checked = due
+            except Exception:
+                pass
+
+    threading.Thread(target=reminder_check_loop, daemon=True, name="reminder-check").start()
+
     messages: dict[str, list[dict]] = {}
 
     def make_user_turn(user_text: str, session_key: str, sys_prompt: str):
@@ -182,36 +283,36 @@ def run_full_mode(
                     queue.enqueue("console", "user", chunk)
                 return reply
             except Exception as exc:
-                return f"[error: {exc}]"
+                return f"[错误: {exc}]"
         return _turn
 
     print_info("=" * 60)
-    print_info(f"  tinyClaw  |  full mode  |  workspace: {workspace}")
-    print_info(f"  Model: {model_id}")
-    print_info(f"  Heartbeat: {heartbeat_interval}s, {hb_start}:00-{hb_end}:00")
-    print_info(f"  Cron jobs: {len(cron.jobs)}")
-    print_info("  Commands: /help, /status, /memory, /queue, /lanes, /trigger, /cron")
+    print_info(f"  tinyClaw  |  全功能模式  |  工作区: {workspace}")
+    print_info(f"  模型: {model_id}")
+    print_info(f"  心跳: 每 {heartbeat_interval} 秒，活跃时段 {hb_start}:00-{hb_end}:00")
+    print_info(f"  定时任务: {len(cron.jobs)} 个")
+    print_info("  命令: /help, /status, /memory, /reminder, /queue, /lanes, /trigger, /cron")
     print_info("=" * 60)
     print()
 
     while True:
         for msg in heartbeat.drain_output():
-            print(f"{CYAN}[heartbeat]{RESET} {msg}")
-            queue.enqueue("console", "user", f"[Heartbeat] {msg}")
+            print(f"{CYAN}[心跳]{RESET} {msg}")
+            queue.enqueue("console", "user", f"[心跳] {msg}")
         for msg in cron.drain_output():
-            print(f"{CYAN}[cron]{RESET} {msg}")
-            queue.enqueue("console", "user", f"[Cron] {msg}")
+            print(f"{CYAN}[定时任务]{RESET} {msg}")
+            queue.enqueue("console", "user", f"[定时任务] {msg}")
 
         try:
-            user_input = input(f"{CYAN}{BOLD}You > {RESET}").strip()
+            user_input = input(f"{CYAN}{BOLD}你 > {RESET}").strip()
         except (KeyboardInterrupt, EOFError):
-            print(f"\n{DIM}Goodbye.{RESET}")
+            print(f"\n{DIM}再见.{RESET}")
             break
 
         if not user_input:
             continue
         if user_input.lower() in ("quit", "exit"):
-            print(f"{DIM}Goodbye.{RESET}")
+            print(f"{DIM}再见.{RESET}")
             break
 
         if user_input.startswith("/"):
@@ -220,15 +321,17 @@ def run_full_mode(
             if cmd == "/help":
                 print_help()
             elif cmd == "/status":
-                print_info(f"  Heartbeat: {heartbeat.status()}")
-                print_info(f"  Delivery: {delivery_runner.get_stats()}")
-                print_info(f"  Cron: {len(cron.list_jobs())} jobs")
+                print_info(f"  心跳: {heartbeat.status()}")
+                print_info(f"  投递: {delivery_runner.get_stats()}")
+                print_info(f"  定时任务: {len(cron.list_jobs())} 个")
             elif cmd == "/memory":
                 stats = memory.get_stats()
-                print_info(f"  Memory stats: {stats}")
+                print_info(f"  记忆统计: {stats}")
+            elif cmd == "/reminder":
+                print_info(f"  {_list_reminders(reminder_store)}")
             elif cmd == "/queue":
                 stats = delivery_runner.get_stats()
-                print_info(f"  Queue: {stats}")
+                print_info(f"  队列: {stats}")
             elif cmd == "/lanes":
                 for name, st in cmd_queue.stats().items():
                     print_info(f"  {name}: {st}")
@@ -237,10 +340,10 @@ def run_full_mode(
                 print_info(f"  {result}")
             elif cmd == "/cron":
                 for j in cron.list_jobs():
-                    tag = f"{GREEN}ON{RESET}" if j["enabled"] else f"{YELLOW}OFF{RESET}"
-                    print(f"  [{tag}] {j['name']} (next: {j.get('next_in', 'n/a')}s)")
+                    tag = f"{GREEN}启用{RESET}" if j["enabled"] else f"{YELLOW}停用{RESET}"
+                    print(f"  [{tag}] {j['name']} (下次: {j.get('next_in', 'n/a')}秒后)")
             else:
-                print_warn(f"Unknown: {cmd}")
+                print_warn(f"未知命令: {cmd}")
             continue
 
         session_key = build_session_key("main", channel="console", peer_id="cli-user")
@@ -262,9 +365,9 @@ def run_full_mode(
             if result:
                 print_assistant(result)
         except concurrent.futures.TimeoutError:
-            print_warn("Request timed out.")
+            print_warn("请求超时。")
         except Exception as exc:
-            print_warn(f"Error: {exc}")
+            print_warn(f"错误: {exc}")
         continue
 
     heartbeat.stop()
@@ -274,7 +377,7 @@ def run_full_mode(
 
 
 # ---------------------------------------------------------------------------
-# CLI mode: simple REPL
+# CLI 模式: 简单 REPL
 # ---------------------------------------------------------------------------
 
 def run_cli_mode(
@@ -294,13 +397,13 @@ def run_cli_mode(
     dispatcher.register_builtin(workdir=workspace)
     dispatcher.register({
         "name": "memory_write",
-        "description": "Save important facts to long-term memory.",
+        "description": "保存重要事实到长期记忆。",
         "input_schema": {"type": "object", "properties": {
             "content": {"type": "string"}}, "required": ["content"]},
     }, lambda content="", **_: memory.write_memory(content))
     dispatcher.register({
         "name": "memory_search",
-        "description": "Search long-term memory.",
+        "description": "搜索长期记忆。",
         "input_schema": {"type": "object", "properties": {
             "query": {"type": "string"}}, "required": ["query"]},
     }, lambda query="", **_: "\n".join(
@@ -325,22 +428,22 @@ def run_cli_mode(
     messages: list[dict] = []
 
     print_info("=" * 60)
-    print_info(f"  tinyClaw  |  CLI mode  |  workspace: {workspace}")
-    print_info(f"  Model: {model_id}  |  Type /help for commands")
+    print_info(f"  tinyClaw  |  CLI 模式  |  工作区: {workspace}")
+    print_info(f"  模型: {model_id}  |  输入 /help 查看命令")
     print_info("=" * 60)
     print()
 
     while True:
         try:
-            user_input = input(f"{CYAN}{BOLD}You > {RESET}").strip()
+            user_input = input(f"{CYAN}{BOLD}你 > {RESET}").strip()
         except (KeyboardInterrupt, EOFError):
-            print(f"\n{DIM}Goodbye.{RESET}")
+            print(f"\n{DIM}再见.{RESET}")
             break
 
         if not user_input:
             continue
         if user_input.lower() in ("quit", "exit"):
-            print(f"{DIM}Goodbye.{RESET}")
+            print(f"{DIM}再见.{RESET}")
             break
         if user_input == "/help":
             print_help()
@@ -355,15 +458,15 @@ def run_cli_mode(
             if reply:
                 print_assistant(reply)
         except Exception as exc:
-            print_warn(f"[error: {exc}]")
+            print_warn(f"[错误: {exc}]")
 
 
 # ---------------------------------------------------------------------------
-# Gateway mode: WebSocket server
+# Gateway 模式: WebSocket 服务器
 # ---------------------------------------------------------------------------
 
 async def _run_agent(mgr, agent_id: str, sk: str, text: str) -> str:
-    """Agent runner for gateway mode."""
+    """Gateway 模式的 Agent runner。"""
     from tinyclaw.agent import AgentLoop
     from tinyclaw.agent.tools import ToolDispatcher
     from tinyclaw.intelligence import BootstrapLoader, build_system_prompt, SkillsManager
@@ -371,7 +474,7 @@ async def _run_agent(mgr, agent_id: str, sk: str, text: str) -> str:
 
     cfg = mgr.get_agent(agent_id)
     if not cfg:
-        return "[unknown agent]"
+        return "[未知 Agent]"
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     base_url = os.getenv("ANTHROPIC_BASE_URL") or None
     ws = _c.create_client(api_key, base_url)
@@ -392,7 +495,7 @@ async def _run_agent(mgr, agent_id: str, sk: str, text: str) -> str:
         reply, _ = loop.run_turn(msgs, text)
         return reply
     except Exception as exc:
-        return f"[error: {exc}]"
+        return f"[错误: {exc}]"
 
 
 async def _gateway_main(port: int, host: str) -> None:
@@ -400,7 +503,7 @@ async def _gateway_main(port: int, host: str) -> None:
     import asyncio
 
     mgr = AgentManager(Path.cwd() / "workspace" / ".agents")
-    mgr.register(AgentConfig(id="main", name="Luna", model="claude-sonnet-4-20250514"))
+    mgr.register(AgentConfig(id="main", name="小 Luna", model="claude-sonnet-4-20250514"))
     bindings = BindingTable()
     bindings.add(Binding(agent_id="main", tier=5, match_key="default", match_value="*"))
 
@@ -414,25 +517,25 @@ async def _gateway_main(port: int, host: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# 入口
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="tinyClaw AI Agent Gateway")
     parser.add_argument("--mode", choices=["full", "cli", "gateway"], default="full",
-                        help="Run mode: full (all features), cli (REPL only), gateway (WebSocket)")
-    parser.add_argument("--workspace", default=None, help="Workspace directory")
-    parser.add_argument("--env", default=None, help=".env file path")
-    parser.add_argument("--port", type=int, default=8765, help="Gateway port (gateway mode)")
-    parser.add_argument("--host", default="localhost", help="Gateway host (gateway mode)")
+                        help="运行模式: full (全部功能), cli (仅 REPL), gateway (WebSocket)")
+    parser.add_argument("--workspace", default=None, help="工作区目录")
+    parser.add_argument("--env", default=None, help=".env 文件路径")
+    parser.add_argument("--port", type=int, default=8765, help="Gateway 端口 (gateway 模式)")
+    parser.add_argument("--host", default="localhost", help="Gateway 主机 (gateway 模式)")
     args = parser.parse_args()
 
     env_path = Path(args.env) if args.env else Path.cwd() / ".env"
     cfg = config.load_config(env_path)
 
     if not cfg["anthropic_api_key"]:
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
-        print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
+        print(f"{YELLOW}错误: ANTHROPIC_API_KEY 未设置。{RESET}")
+        print(f"{DIM}请将 .env.example 复制为 .env 并填入你的 API Key。{RESET}")
         sys.exit(1)
 
     workspace = _resolve_workspace(args.workspace)

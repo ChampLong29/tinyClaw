@@ -16,7 +16,7 @@ class CLIChannel(Channel):
 
     def receive(self) -> InboundMessage | None:
         try:
-            text = input(f"{CYAN}{BOLD}You > {RESET}").strip()
+            text = input(f"{CYAN}{BOLD}你 > {RESET}").strip()
         except (KeyboardInterrupt, EOFError):
             return None
         if not text:
@@ -31,5 +31,5 @@ class CLIChannel(Channel):
 
     def send(self, to: str, text: str, **kwargs) -> bool:
         from tinyclaw.utils.ansi import GREEN
-        print(f"\n{GREEN}{BOLD}Assistant:{RESET} {text}\n")
+        print(f"\n{GREEN}{BOLD}助手:{RESET} {text}\n")
         return True

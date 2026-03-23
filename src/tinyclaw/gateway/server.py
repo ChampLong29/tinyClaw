@@ -9,7 +9,7 @@ import threading
 from typing import Any
 
 from tinyclaw.gateway.routing import (
-    AgentManager, BindingTable, GatewayServer as GW,
+    AgentManager, BindingTable,
     normalize_agent_id, build_session_key, resolve_route,
 )
 

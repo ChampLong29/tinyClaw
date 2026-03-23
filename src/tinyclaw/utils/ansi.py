@@ -17,12 +17,12 @@ ORANGE = "\033[38;5;208m"
 
 def colored_prompt() -> str:
     """Return a colored user prompt prefix."""
-    return f"{CYAN}{BOLD}You > {RESET}"
+    return f"{CYAN}{BOLD}你 > {RESET}"
 
 
 def print_assistant(text: str) -> None:
     """Print assistant response."""
-    print(f"\n{GREEN}{BOLD}Assistant:{RESET} {text}\n")
+    print(f"\n{GREEN}{BOLD}助手:{RESET} {text}\n")
 
 
 def print_info(text: str) -> None:
