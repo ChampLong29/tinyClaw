@@ -62,21 +62,21 @@ class HeartbeatRunner:
     def should_run(self) -> tuple[bool, str]:
         """Pre-flight checks. Lock check is handled in _execute()."""
         if not self.heartbeat_path.exists():
-            return False, "HEARTBEAT.md not found"
+            return False, "HEARTBEAT.md 未找到"
         if not self.heartbeat_path.read_text(encoding="utf-8").strip():
-            return False, "HEARTBEAT.md is empty"
+            return False, "HEARTBEAT.md 为空"
         now = time.time()
         elapsed = now - self.last_run_at
         if elapsed < self.interval:
-            return False, f"interval not elapsed ({self.interval - elapsed:.0f}s remaining)"
+            return False, f"间隔未到（还剩 {self.interval - elapsed:.0f}秒）"
         hour = datetime.now().hour
         s, e = self.active_hours
         in_hours = (s <= hour < e) if s <= e else not (e <= hour < s)
         if not in_hours:
-            return False, f"outside active hours ({s}:00-{e}:00)"
+            return False, f"不在活跃时段内 ({s}:00-{e}:00)"
         if self.running:
-            return False, "already running"
-        return True, "all checks passed"
+            return False, "正在运行中"
+        return True, "所有检查通过"
 
     def _build_prompt(self) -> tuple[str, str]:
         """Build heartbeat instructions and system prompt."""
@@ -139,7 +139,7 @@ class HeartbeatRunner:
                 self._output_queue.append(meaningful)
         except Exception as exc:
             with self._queue_lock:
-                self._output_queue.append(f"[heartbeat error: {exc}]")
+                self._output_queue.append(f"[心跳错误: {exc}]")
         finally:
             self.running = False
             self.last_run_at = time.time()
@@ -178,29 +178,29 @@ class HeartbeatRunner:
         """Manually trigger heartbeat, bypassing interval check."""
         acquired = self.lane_lock.acquire(blocking=False)
         if not acquired:
-            return "main lane occupied, cannot trigger"
+            return "主队列被占用，无法触发"
         self.running = True
         try:
             instructions, sys_prompt = self._build_prompt()
             if not instructions:
-                return "HEARTBEAT.md is empty"
+                return "HEARTBEAT.md 为空"
             if self.client_factory:
                 response = run_agent_single_turn(
                     instructions, sys_prompt, self.client_factory, self.model
                 )
             else:
-                return "no client factory"
+                return "未配置客户端"
             meaningful = self._parse_response(response)
             if meaningful is None:
-                return "HEARTBEAT_OK (nothing to report)"
+                return "无需报告的内容"
             if meaningful.strip() == self._last_output:
-                return "duplicate content (skipped)"
+                return "内容重复，已跳过"
             self._last_output = meaningful.strip()
             with self._queue_lock:
                 self._output_queue.append(meaningful)
-            return f"triggered, output queued ({len(meaningful)} chars)"
+            return f"已触发，输出已加入队列 ({len(meaningful)} 字符)"
         except Exception as exc:
-            return f"trigger failed: {exc}"
+            return f"触发失败: {exc}"
         finally:
             self.running = False
             self.last_run_at = time.time()
@@ -218,10 +218,10 @@ class HeartbeatRunner:
             "running": self.running,
             "should_run": ok,
             "reason": reason,
-            "last_run": (datetime.fromtimestamp(self.last_run_at).isoformat()
-                         if self.last_run_at > 0 else "never"),
-            "next_in": f"{round(next_in)}s",
-            "interval": f"{self.interval}s",
+            "last_run": (datetime.fromtimestamp(self.last_run_at).strftime("%Y-%m-%d %H:%M:%S")
+                         if self.last_run_at > 0 else "从未"),
+            "next_in": round(next_in),
+            "interval": self.interval,
             "active_hours": f"{self.active_hours[0]}:00-{self.active_hours[1]}:00",
             "queue_size": qsize,
         }

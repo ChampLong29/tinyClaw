@@ -90,10 +90,11 @@ class DeliveryRunner:
     def get_stats(self) -> dict:
         pending = self.queue.load_pending()
         failed = self.queue.load_failed()
+        in_flight = max(0, self.total_attempted - len(pending) - self.total_succeeded - self.total_failed)
         return {
             "pending": len(pending),
+            "in_flight": in_flight,
             "failed": len(failed),
             "total_attempted": self.total_attempted,
-            "total_succeeded": self.total_succeeded,
-            "total_failed": self.total_failed,
+            "delivered": self.total_succeeded,
         }

@@ -321,27 +321,49 @@ def run_full_mode(
             if cmd == "/help":
                 print_help()
             elif cmd == "/status":
-                print_info(f"  心跳: {heartbeat.status()}")
-                print_info(f"  投递: {delivery_runner.get_stats()}")
-                print_info(f"  定时任务: {len(cron.list_jobs())} 个")
+                # 心跳状态
+                hb = heartbeat.status()
+                running = "运行中" if hb.get("running") else "空闲"
+                should = "是" if hb.get("should_run") else "否"
+                print_info(f"  启用: {'是' if hb.get('enabled') else '否'}")
+                print_info(f"  状态: {running}")
+                print_info(f"  即将运行: {should} ({hb.get('reason', '')})")
+                print_info(f"  上次运行: {hb.get('last_run', '从未')}")
+                print_info(f"  下次运行: {hb.get('next_in', 'n/a')}后")
+                # 投递状态
+                ds = delivery_runner.get_stats()
+                print_info(f"  待投递: {ds.get('pending', 0)}")
+                print_info(f"  投递失败: {ds.get('failed', 0)}")
+                print_info(f"  已投递: {ds.get('delivered', 0)}")
+                # 定时任务
+                jobs = cron.list_jobs()
+                print_info(f"  定时任务: {len(jobs)} 个")
             elif cmd == "/memory":
                 stats = memory.get_stats()
-                print_info(f"  记忆统计: {stats}")
+                print_info(f"  常青记忆: {stats.get('evergreen_chars', 0)} 字符")
+                print_info(f"  日常记录: {stats.get('daily_entries', 0)} 条")
             elif cmd == "/reminder":
                 print_info(f"  {_list_reminders(reminder_store)}")
             elif cmd == "/queue":
-                stats = delivery_runner.get_stats()
-                print_info(f"  队列: {stats}")
+                qs = delivery_runner.get_stats()
+                print_info(f"  待投递: {qs.get('pending', 0)}")
+                print_info(f"  投递中: {qs.get('in_flight', 0)}")
+                print_info(f"  失败: {qs.get('failed', 0)}")
+                print_info(f"  已完成: {qs.get('delivered', 0)}")
             elif cmd == "/lanes":
                 for name, st in cmd_queue.stats().items():
-                    print_info(f"  {name}: {st}")
+                    lane_name = {"main": "主队列", "cron": "定时任务", "heartbeat": "心跳"}.get(name, name)
+                    print_info(f"  {lane_name}: 队列深度={st.get('queue_depth', 0)}, 活跃={st.get('active', 0)}, 最大并发={st.get('max_concurrency', 0)}")
             elif cmd == "/trigger":
                 result = heartbeat.trigger()
                 print_info(f"  {result}")
             elif cmd == "/cron":
                 for j in cron.list_jobs():
                     tag = f"{GREEN}启用{RESET}" if j["enabled"] else f"{YELLOW}停用{RESET}"
-                    print(f"  [{tag}] {j['name']} (下次: {j.get('next_in', 'n/a')}秒后)")
+                    next_in = j.get('next_in')
+                    next_str = f"{next_in}秒后" if next_in is not None else "未计划"
+                    last_run = j.get('last_run', '从未')
+                    print(f"  [{tag}] {j['name']} | 下次: {next_str} | 上次: {last_run}")
             else:
                 print_warn(f"未知命令: {cmd}")
             continue
