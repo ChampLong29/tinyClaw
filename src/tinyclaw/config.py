@@ -36,6 +36,7 @@ def load_config(env_path: Path | None = None) -> dict[str, Any]:
         "feishu_webhook_host": os.getenv("FEISHU_WEBHOOK_HOST", "0.0.0.0").strip(),
         "feishu_webhook_port": int(os.getenv("FEISHU_WEBHOOK_PORT", "8766")),
         "feishu_webhook_path": os.getenv("FEISHU_WEBHOOK_PATH", "/feishu/events").strip(),
+        "feishu_reminder_to": os.getenv("FEISHU_REMINDER_TO", "").strip(),
         # Heartbeat
         "heartbeat_interval": float(os.getenv("HEARTBEAT_INTERVAL", "1800")),
         "heartbeat_active_start": int(os.getenv("HEARTBEAT_ACTIVE_START", "9")),

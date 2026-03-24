@@ -111,6 +111,11 @@ class FeishuChannel(Channel):
         if "challenge" in payload:
             return None
 
+        header = payload.get("header", {})
+        event_type = header.get("event_type", "")
+        if event_type == "p2.im.chat.access_event.bot_p2p_chat_entered_v1":
+            return self.parse_session_event(payload)
+
         event = payload.get("event", {})
         message = event.get("message", {})
         sender = event.get("sender", {}).get("sender_id", {})
@@ -131,6 +136,31 @@ class FeishuChannel(Channel):
             account_id=self.account_id,
             peer_id=user_id if chat_type == "p2p" else chat_id,
             media=media, is_group=is_group, raw=payload,
+        )
+
+    def parse_session_event(self, payload: dict) -> InboundMessage | None:
+        """Parse bot-p2p-chat-entered event as a synthetic inbound message."""
+        header = payload.get("header", {})
+        event = payload.get("event", {})
+        chat_id = event.get("chat_id", "")
+        operator = event.get("operator_id", {})
+        sender_id = ""
+        if isinstance(operator, dict):
+            sender_id = operator.get("open_id", "") or operator.get("user_id", "")
+        if not chat_id:
+            return None
+        return InboundMessage(
+            text="__feishu_session_started__",
+            sender_id=sender_id,
+            channel="feishu",
+            account_id=self.account_id,
+            peer_id=chat_id,
+            is_group=False,
+            raw={
+                "event_type": "p2.im.chat.access_event.bot_p2p_chat_entered_v1",
+                "event_id": header.get("event_id", ""),
+                "payload": payload,
+            },
         )
 
     def receive(self) -> InboundMessage | None:
@@ -229,7 +259,10 @@ class FeishuLongConnectionChannel(AsyncChannel):
         # starts). Otherwise the module-level get_event_loop() captures the
         # running gateway loop.
         from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-        from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+        from lark_oapi.api.im.v1 import (
+            P2ImMessageReceiveV1,
+            P2ImChatAccessEventBotP2pChatEnteredV1,
+        )
 
         def on_message_receive(event):
             try:
@@ -284,10 +317,43 @@ class FeishuLongConnectionChannel(AsyncChannel):
             except Exception as exc:
                 print(f"[feishu] 处理消息异常: {exc}")
 
+        def on_session_started(event):
+            """Handle p2p first-chat-entered event and surface to ChannelManager."""
+            try:
+                event_data = getattr(event, "event", None)
+                if not event_data:
+                    return
+                chat_id = getattr(event_data, "chat_id", "")
+                if not chat_id:
+                    return
+
+                operator = getattr(event_data, "operator_id", None)
+                sender_id = ""
+                if operator is not None:
+                    sender_id = getattr(operator, "open_id", "") or getattr(operator, "user_id", "")
+
+                header = getattr(event, "header", None)
+                event_id = getattr(header, "event_id", "") if header else ""
+
+                self._msg_queue.put(InboundMessage(
+                    text="__feishu_session_started__",
+                    sender_id=sender_id,
+                    channel="feishu",
+                    account_id=self.account_id,
+                    peer_id=chat_id,
+                    is_group=False,
+                    raw={
+                        "event_type": "p2.im.chat.access_event.bot_p2p_chat_entered_v1",
+                        "event_id": event_id,
+                    },
+                ))
+            except Exception as exc:
+                print(f"[feishu] 会话创建事件处理异常: {exc}")
+
         class _Processor:
-            def __init__(self, cb):
+            def __init__(self, cb, event_type_cls):
                 self._cb = cb
-                self._type = P2ImMessageReceiveV1
+                self._type = event_type_cls
 
             def type(self):
                 return self._type
@@ -297,7 +363,14 @@ class FeishuLongConnectionChannel(AsyncChannel):
                 return None
 
         handler = EventDispatcherHandler()
-        handler._processorMap["p2.im.message.receive_v1"] = _Processor(on_message_receive)
+        handler._processorMap["p2.im.message.receive_v1"] = _Processor(
+            on_message_receive,
+            P2ImMessageReceiveV1,
+        )
+        handler._processorMap["p2.im.chat.access_event.bot_p2p_chat_entered_v1"] = _Processor(
+            on_session_started,
+            P2ImChatAccessEventBotP2pChatEnteredV1,
+        )
 
         from lark_oapi.ws import Client as FeishuWSClient
         domain = ("https://open.feishu.cn"

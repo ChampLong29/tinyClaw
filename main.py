@@ -196,6 +196,19 @@ def print_help() -> None:
     print_info("  quit/exit -- 退出程序")
 
 
+def _build_feishu_intro() -> str:
+    return (
+        "你好，我是 tinyClaw 助手。\n"
+        "我现在可以在飞书中为你提供对话、记忆和提醒服务。\n\n"
+        "常见命令：\n"
+        "1. 记住：例如“记住我喜欢黑咖啡”\n"
+        "2. 检索记忆：例如“我之前说过什么偏好？”\n"
+        "3. 设置提醒：例如“30分钟后提醒我开会”\n"
+        "4. 查看提醒：例如“列出我的提醒”\n\n"
+        "你可以直接用自然语言下达任务。"
+    )
+
+
 def run_app(
     workspace: Path,
     cfg: dict[str, Any],
@@ -395,6 +408,40 @@ def run_app(
     feishu_long: FeishuLongConnectionChannel | None = None
     feishu_webhook: FeishuChannel | None = None
     feishu_sender: Any = None
+    feishu_fixed_reminder_to = cfg.get("feishu_reminder_to", "")
+    feishu_state_path = workspace / ".state" / "feishu" / "known_peers.json"
+    if feishu_state_path.exists():
+        try:
+            _saved = json.loads(feishu_state_path.read_text(encoding="utf-8"))
+            feishu_known_peers: set[str] = set(_saved.get("known_peers", []))
+            last_active_feishu_peer = _saved.get("last_active_peer", "") or feishu_fixed_reminder_to
+            welcomed_event_ids: set[str] = set(_saved.get("welcomed_event_ids", []))
+        except (json.JSONDecodeError, OSError):
+            feishu_known_peers = set()
+            last_active_feishu_peer = feishu_fixed_reminder_to
+            welcomed_event_ids = set()
+    else:
+        feishu_known_peers = set()
+        last_active_feishu_peer = feishu_fixed_reminder_to
+        welcomed_event_ids = set()
+
+    def save_feishu_state() -> None:
+        event_ids = sorted(welcomed_event_ids)
+        if len(event_ids) > 1000:
+            event_ids = event_ids[-1000:]
+        feishu_state_path.parent.mkdir(parents=True, exist_ok=True)
+        feishu_state_path.write_text(
+            json.dumps(
+                {
+                    "known_peers": sorted(feishu_known_peers),
+                    "last_active_peer": last_active_feishu_peer,
+                    "welcomed_event_ids": event_ids,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     fs_app_id = cfg.get("feishu_app_id", "")
     fs_app_secret = cfg.get("feishu_app_secret", "")
@@ -478,6 +525,7 @@ def run_app(
     threading.Thread(target=cron_loop, daemon=True, name="cron-tick").start()
 
     def reminder_check_loop() -> None:
+        nonlocal last_active_feishu_peer
         while not stop_event.is_set():
             stop_event.wait(timeout=60)
             if stop_event.is_set():
@@ -485,7 +533,12 @@ def run_app(
             try:
                 due = reminder_store.get_due_reminders()
                 for r in due:
-                    delivery_queue.enqueue("cli", "cli-user", f"[提醒] {r['content']}")
+                    reminder_text = f"[提醒] {r['content']}"
+                    target_peer = feishu_fixed_reminder_to or last_active_feishu_peer
+                    if server_mode and feishu_sender and target_peer:
+                        delivery_queue.enqueue("feishu", target_peer, reminder_text)
+                    else:
+                        delivery_queue.enqueue("cli", "cli-user", reminder_text)
                     reminder_store.mark_reminded(r.get("ts", ""))
             except Exception:
                 pass
@@ -493,6 +546,34 @@ def run_app(
     threading.Thread(target=reminder_check_loop, daemon=True, name="reminder-check").start()
 
     def handle_inbound_message(msg: Any) -> None:
+        nonlocal last_active_feishu_peer
+        if msg.channel == "feishu":
+            raw = msg.raw if isinstance(msg.raw, dict) else {}
+            event_type = raw.get("event_type", "")
+            event_id = raw.get("event_id", "")
+
+            if event_type == "p2.im.chat.access_event.bot_p2p_chat_entered_v1":
+                if event_id and event_id in welcomed_event_ids:
+                    return
+                if event_id:
+                    welcomed_event_ids.add(event_id)
+                if msg.peer_id and msg.peer_id not in feishu_known_peers:
+                    feishu_known_peers.add(msg.peer_id)
+                if msg.peer_id:
+                    last_active_feishu_peer = msg.peer_id
+                save_feishu_state()
+                if feishu_sender and msg.peer_id:
+                    delivery_queue.enqueue("feishu", msg.peer_id, _build_feishu_intro())
+                return
+
+            if msg.peer_id:
+                last_active_feishu_peer = msg.peer_id
+            if msg.peer_id and msg.peer_id not in feishu_known_peers:
+                feishu_known_peers.add(msg.peer_id)
+                save_feishu_state()
+                if feishu_sender:
+                    delivery_queue.enqueue("feishu", msg.peer_id, _build_feishu_intro())
+
         aid, sk = resolve_route(bindings, mgr, msg.channel, msg.peer_id, account_id=msg.account_id)
         future = cmd_queue.enqueue(LANE_MAIN, lambda: run_turn(msg.text, sk, msg.channel, aid))
         try:
@@ -500,6 +581,8 @@ def run_app(
             if reply:
                 for chunk in chunk_message(reply, msg.channel):
                     delivery_queue.enqueue(msg.channel, msg.peer_id, chunk)
+            if msg.channel == "feishu":
+                save_feishu_state()
         except concurrent.futures.TimeoutError:
             print_warn("渠道消息处理超时")
         except Exception as exc:
