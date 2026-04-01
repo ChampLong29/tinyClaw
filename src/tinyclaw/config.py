@@ -18,6 +18,21 @@ def load_config(env_path: Path | None = None) -> dict[str, Any]:
         env_path = Path.cwd() / ".env"
     load_dotenv(env_path, override=True)
 
+    legacy_wecom_cli_enabled = os.getenv("WECOM_CLI_ENABLED", "").strip().lower() in ("1", "true")
+    raw_wecom_tool_enabled = os.getenv("WECOM_CLI_TOOL_ENABLED", "").strip().lower()
+    raw_wecom_poll_enabled = os.getenv("WECOM_CLI_POLL_ENABLED", "").strip().lower()
+
+    wecom_cli_tool_enabled = (
+        raw_wecom_tool_enabled in ("1", "true")
+        if raw_wecom_tool_enabled
+        else legacy_wecom_cli_enabled
+    )
+    wecom_cli_poll_enabled = (
+        raw_wecom_poll_enabled in ("1", "true")
+        if raw_wecom_poll_enabled
+        else legacy_wecom_cli_enabled
+    )
+
     return {
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "model_id": os.getenv("MODEL_ID", "claude-sonnet-4-20250514"),
@@ -37,10 +52,34 @@ def load_config(env_path: Path | None = None) -> dict[str, Any]:
         "feishu_webhook_port": int(os.getenv("FEISHU_WEBHOOK_PORT", "8766")),
         "feishu_webhook_path": os.getenv("FEISHU_WEBHOOK_PATH", "/feishu/events").strip(),
         "feishu_reminder_to": os.getenv("FEISHU_REMINDER_TO", "").strip(),
+        # WeCom CLI bridge
+        "wecom_cli_enabled": legacy_wecom_cli_enabled,
+        "wecom_cli_tool_enabled": wecom_cli_tool_enabled,
+        "wecom_cli_poll_enabled": wecom_cli_poll_enabled,
+        "wecom_cli_bin": os.getenv("WECOM_CLI_BIN", "wecom-cli").strip(),
+        "wecom_cli_poll_interval": float(os.getenv("WECOM_CLI_POLL_INTERVAL", "3")),
+        "wecom_cli_health_log_interval": float(os.getenv("WECOM_CLI_HEALTH_LOG_INTERVAL", "30")),
+        "wecom_cli_lookback_seconds": int(os.getenv("WECOM_CLI_LOOKBACK_SECONDS", "300")),
+        "wecom_cli_overlap_seconds": int(os.getenv("WECOM_CLI_OVERLAP_SECONDS", "5")),
+        "wecom_cli_debug": os.getenv("WECOM_CLI_DEBUG", "").lower() in ("1", "true"),
+        # Work WeChat (企业微信)
+        "workwechat_mode": os.getenv("WORKWECHAT_MODE", "off").strip().lower(),
+        "workwechat_bot_id": os.getenv("WORKWECHAT_BOT_ID", "").strip(),
+        "workwechat_bot_secret": os.getenv("WORKWECHAT_BOT_SECRET", "").strip(),
+        "workwechat_ws_url": os.getenv("WORKWECHAT_WS_URL", "wss://openws.work.weixin.qq.com").strip(),
+        "workwechat_ping_interval_sec": int(os.getenv("WORKWECHAT_PING_INTERVAL_SEC", "30") or "30"),
+        "workwechat_corp_id": os.getenv("WORKWECHAT_CORP_ID", "").strip(),
+        "workwechat_corp_secret": os.getenv("WORKWECHAT_CORP_SECRET", "").strip(),
+        "workwechat_agent_id": int(os.getenv("WORKWECHAT_AGENT_ID", "0") or "0"),
+        "workwechat_webhook_host": os.getenv("WORKWECHAT_WEBHOOK_HOST", "0.0.0.0").strip(),
+        "workwechat_webhook_port": int(os.getenv("WORKWECHAT_WEBHOOK_PORT", "8767")),
+        "workwechat_webhook_path": os.getenv("WORKWECHAT_WEBHOOK_PATH", "/workwechat/events").strip(),
+        "workwechat_webhook_token": os.getenv("WORKWECHAT_WEBHOOK_TOKEN", "").strip(),
         # Heartbeat
         "heartbeat_interval": float(os.getenv("HEARTBEAT_INTERVAL", "1800")),
         "heartbeat_active_start": int(os.getenv("HEARTBEAT_ACTIVE_START", "9")),
         "heartbeat_active_end": int(os.getenv("HEARTBEAT_ACTIVE_END", "22")),
+        "reminder_check_interval": float(os.getenv("REMINDER_CHECK_INTERVAL", "60")),
     }
 
 

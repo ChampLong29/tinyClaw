@@ -5,8 +5,12 @@ from tinyclaw.channel.base import (
 )
 from tinyclaw.channel.feishu import FeishuChannel, FeishuLongConnectionChannel
 from tinyclaw.channel.telegram import TelegramChannel
+from tinyclaw.channel.wecom_cli import WeComCliChannel
+from tinyclaw.channel.workwechat import WorkWeChatChannel, WorkWeChatLongConnectionChannel
 
 __all__ = [
     "AsyncChannel", "Channel", "InboundMessage", "ChannelAccount", "ChannelManager",
     "FeishuChannel", "FeishuLongConnectionChannel", "TelegramChannel",
+    "WeComCliChannel",
+    "WorkWeChatChannel", "WorkWeChatLongConnectionChannel",
 ]

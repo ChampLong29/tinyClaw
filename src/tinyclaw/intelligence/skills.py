@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -77,10 +78,22 @@ class SkillsManager:
         scan_order: list[Path] = []
         if extra_dirs:
             scan_order.extend(extra_dirs)
+
+        # Allow explicit extra skill directories from env.
+        # Use os.pathsep so macOS/Linux ':' and Windows ';' both work.
+        env_dirs = os.getenv("TINYCLAW_SKILL_DIRS", "").strip()
+        if env_dirs:
+            for raw in env_dirs.split(os.pathsep):
+                path = raw.strip()
+                if path:
+                    scan_order.append(Path(path).expanduser())
+
         scan_order.extend([
             self.workspace_dir / "skills",
             self.workspace_dir / ".skills",
             self.workspace_dir / ".agents" / "skills",
+            # Official Copilot/Claude-style skill installation path.
+            Path.home() / ".agents" / "skills",
             Path.cwd() / ".agents" / "skills",
             Path.cwd() / "skills",
         ])

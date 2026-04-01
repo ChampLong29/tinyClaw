@@ -182,6 +182,19 @@ MODEL_ID=claude-sonnet-4-20250514
 # FEISHU_APP_SECRET=xxxxxxxx
 # FEISHU_IS_LARK=true
 
+# Work WeChat 智能机器人 (可选，见下方「企业微信接入」)
+# WORKWECHAT_MODE=long
+# WORKWECHAT_BOT_ID=AIBOTID
+# WORKWECHAT_BOT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# WORKWECHAT_WS_URL=wss://openws.work.weixin.qq.com
+# WORKWECHAT_PING_INTERVAL_SEC=30
+
+# WeCom CLI (可选)
+# WECOM_CLI_TOOL_ENABLED=true      # 让模型可调用 wecom-cli 工具
+# WECOM_CLI_POLL_ENABLED=false     # 是否把 wecom-cli 作为入站轮询通道
+# WECOM_CLI_ENABLED=true            # 兼容旧配置（等价同时开启 tool + poll）
+# WECOM_CLI_BIN=wecom-cli
+
 # 心跳 (可选)
 # HEARTBEAT_INTERVAL=1800
 # HEARTBEAT_ACTIVE_START=9
@@ -275,9 +288,82 @@ https://<your-ngrok-domain>/feishu/events
 
 ---
 
+## 企业微信接入
+
+本项目已支持企业微信智能机器人两种接入模式：
+
+- long：官方长连接（推荐）
+- webhook：短连接桥接（用于已有网关/CLI 桥接场景）
+
+官方文档参考：
+- https://developer.work.weixin.qq.com/document/path/101463
+
+### 长连接模式（推荐）
+
+```sh
+# .env
+WORKWECHAT_MODE=long
+WORKWECHAT_BOT_ID=AIBOTID
+WORKWECHAT_BOT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+WORKWECHAT_WS_URL=wss://openws.work.weixin.qq.com
+WORKWECHAT_PING_INTERVAL_SEC=30
+```
+
+特点：
+
+- 无需公网回调地址
+- 无需处理 webhook 加解密
+- 低延迟，适合实时交互
+
+### Webhook 模式（桥接）
+
+```sh
+# .env
+WORKWECHAT_MODE=webhook
+WORKWECHAT_CORP_ID=wwxxxxxxxxxxxxxxxx
+WORKWECHAT_CORP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+WORKWECHAT_AGENT_ID=1000002
+WORKWECHAT_WEBHOOK_HOST=0.0.0.0
+WORKWECHAT_WEBHOOK_PORT=8767
+WORKWECHAT_WEBHOOK_PATH=/workwechat/events
+WORKWECHAT_WEBHOOK_TOKEN=change-me
+```
+
+说明：Webhook 模式当前接收标准化 JSON 事件，适合你已有企业微信 CLI/桥接进程时快速接入 tinyClaw。
+
+### WeCom CLI 工具模式（推荐与长连接配合）
+
+如果你的目标是“机器人身份回复 + 个人账号代操作”，建议：
+
+- 入站和机器人回复走 `WORKWECHAT_MODE=long`
+- `wecom-cli` 仅作为模型可调用工具，不作为入站轮询
+
+示例：
+
+```sh
+# .env
+WECOM_CLI_TOOL_ENABLED=true
+WECOM_CLI_POLL_ENABLED=false
+WECOM_CLI_BIN=wecom-cli
+```
+
+说明：
+
+- `WECOM_CLI_TOOL_ENABLED=true` 时，模型可以调用 wecom-cli 发送/查询
+- `WECOM_CLI_POLL_ENABLED=false` 时，不会把你个人账号消息轮询进来，避免“自己和自己对话”
+- 旧变量 `WECOM_CLI_ENABLED` 仍可用，等价于同时开启 tool 和 poll
+
+---
+
 ## Skills 与中文支持
 
 `workspace/skills/` 目录下的技能文件会被加载到 Agent 的 System Prompt 中。
+
+此外，tinyClaw 也会自动加载用户级 Skills 目录：
+
+- `~/.agents/skills`
+
+这意味着你安装在用户目录的官方 wecom-cli skills 也会被模型看到并利用其流程规范。
 
 ### 中文环境优化
 

@@ -21,6 +21,9 @@ class ReminderStore:
         self,
         content: str,
         due_time: datetime | None = None,
+        channel: str = "",
+        peer_id: str = "",
+        account_id: str = "",
     ) -> str:
         """Write a reminder with due time."""
         due_str = due_time.isoformat() if due_time else ""
@@ -30,6 +33,9 @@ class ReminderStore:
             "due": due_str,
             "content": content,
             "done": False,
+            "channel": channel,
+            "peer_id": peer_id,
+            "account_id": account_id,
         }
 
         path = self.reminder_dir / f"{datetime.now(timezone.utc).strftime('%Y%m%d')}.jsonl"

@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any
 
 BACKOFF_MS = [5_000, 25_000, 120_000, 600_000]  # [5s, 25s, 2min, 10min]
 MAX_RETRIES = 5
@@ -32,6 +32,7 @@ class QueuedDelivery:
     channel: str
     to: str
     text: str
+    meta: dict[str, Any] = field(default_factory=dict)
     retry_count: int = 0
     last_error: str | None = None
     enqueued_at: float = field(default_factory=time.time)
@@ -40,14 +41,18 @@ class QueuedDelivery:
     def to_dict(self) -> dict:
         return {
             "id": self.id, "channel": self.channel, "to": self.to, "text": self.text,
+            "meta": self.meta,
             "retry_count": self.retry_count, "last_error": self.last_error,
             "enqueued_at": self.enqueued_at, "next_retry_at": self.next_retry_at,
         }
 
     @staticmethod
     def from_dict(data: dict) -> "QueuedDelivery":
+        raw_meta = data.get("meta", {})
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
         return QueuedDelivery(
             id=data["id"], channel=data["channel"], to=data["to"], text=data["text"],
+            meta=meta,
             retry_count=data.get("retry_count", 0),
             last_error=data.get("last_error"),
             enqueued_at=data.get("enqueued_at", 0.0),
@@ -74,7 +79,7 @@ class DeliveryQueue:
         self.failed_dir.mkdir(parents=True, exist_ok=True)
         self._lock = __import__("threading").Lock()
 
-    def enqueue(self, channel: str, to: str, text: str) -> str:
+    def enqueue(self, channel: str, to: str, text: str, meta: dict[str, Any] | None = None) -> str:
         """Create entry and atomically write to disk. Returns delivery_id."""
         delivery_id = uuid.uuid4().hex[:12]
         entry = QueuedDelivery(
@@ -82,6 +87,7 @@ class DeliveryQueue:
             channel=channel,
             to=to,
             text=text,
+            meta=meta or {},
             enqueued_at=time.time(),
             next_retry_at=0.0,
         )

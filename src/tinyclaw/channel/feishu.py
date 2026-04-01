@@ -259,10 +259,10 @@ class FeishuLongConnectionChannel(AsyncChannel):
         # starts). Otherwise the module-level get_event_loop() captures the
         # running gateway loop.
         from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-        from lark_oapi.api.im.v1 import (
-            P2ImMessageReceiveV1,
-            P2ImChatAccessEventBotP2pChatEnteredV1,
-        )
+        import lark_oapi.api.im.v1 as im_v1
+
+        P2ImMessageReceiveV1 = im_v1.P2ImMessageReceiveV1
+        P2ImChatAccessEventBotP2pChatEnteredV1 = im_v1.P2ImChatAccessEventBotP2pChatEnteredV1
 
         def on_message_receive(event):
             try:
@@ -350,6 +350,10 @@ class FeishuLongConnectionChannel(AsyncChannel):
             except Exception as exc:
                 print(f"[feishu] 会话创建事件处理异常: {exc}")
 
+        def on_noop(_event):
+            # Ignore non-business events such as read receipts.
+            return
+
         class _Processor:
             def __init__(self, cb, event_type_cls):
                 self._cb = cb
@@ -371,6 +375,17 @@ class FeishuLongConnectionChannel(AsyncChannel):
             on_session_started,
             P2ImChatAccessEventBotP2pChatEnteredV1,
         )
+
+        # Some tenants may also push read-receipt events. Register as no-op
+        # when the corresponding event type exists in current SDK version.
+        for _event_key, _class_name in (
+            ("im.message.message_read_v1", "ImMessageMessageReadV1"),
+            ("p2.im.message.message_read_v1", "P2ImMessageMessageReadV1"),
+            ("p2.im.message.message_read_v1", "P2ImMessageReadV1"),
+        ):
+            _cls = getattr(im_v1, _class_name, None)
+            if _cls is not None:
+                handler._processorMap[_event_key] = _Processor(on_noop, _cls)
 
         from lark_oapi.ws import Client as FeishuWSClient
         domain = ("https://open.feishu.cn"

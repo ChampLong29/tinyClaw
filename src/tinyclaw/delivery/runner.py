@@ -22,7 +22,7 @@ class DeliveryRunner:
     def __init__(
         self,
         queue: DeliveryQueue,
-        deliver_fn: Callable[[str, str, str], None],  # (channel, to, text) -> None
+        deliver_fn: Callable[[str, str, str, dict[str, Any] | None], None],
     ) -> None:
         self.queue = queue
         self.deliver_fn = deliver_fn
@@ -74,7 +74,7 @@ class DeliveryRunner:
 
             self.total_attempted += 1
             try:
-                self.deliver_fn(entry.channel, entry.to, entry.text)
+                self.deliver_fn(entry.channel, entry.to, entry.text, entry.meta)
                 self.queue.ack(entry.id)
                 self.total_succeeded += 1
             except Exception as exc:
