@@ -75,6 +75,18 @@ def load_config(env_path: Path | None = None) -> dict[str, Any]:
         "workwechat_webhook_port": int(os.getenv("WORKWECHAT_WEBHOOK_PORT", "8767")),
         "workwechat_webhook_path": os.getenv("WORKWECHAT_WEBHOOK_PATH", "/workwechat/events").strip(),
         "workwechat_webhook_token": os.getenv("WORKWECHAT_WEBHOOK_TOKEN", "").strip(),
+        # DingTalk (钉钉)
+        "dingtalk_mode": os.getenv("DINGTALK_MODE", "off").strip().lower(),
+        "dingtalk_client_id": os.getenv("DINGTALK_CLIENT_ID", "").strip(),
+        "dingtalk_client_secret": os.getenv("DINGTALK_CLIENT_SECRET", "").strip(),
+        "dingtalk_access_token": os.getenv("DINGTALK_ACCESS_TOKEN", "").strip(),
+        "dingtalk_secret": os.getenv("DINGTALK_SECRET", "").strip(),
+        "dingtalk_webhook_url": os.getenv("DINGTALK_WEBHOOK_URL", "").strip(),
+        "dingtalk_api_base": os.getenv("DINGTALK_API_BASE", "https://oapi.dingtalk.com").strip(),
+        "dingtalk_webhook_host": os.getenv("DINGTALK_WEBHOOK_HOST", "0.0.0.0").strip(),
+        "dingtalk_webhook_port": int(os.getenv("DINGTALK_WEBHOOK_PORT", "8768")),
+        "dingtalk_webhook_path": os.getenv("DINGTALK_WEBHOOK_PATH", "/dingtalk/events").strip(),
+        "dingtalk_webhook_token": os.getenv("DINGTALK_WEBHOOK_TOKEN", "").strip(),
         # Heartbeat
         "heartbeat_interval": float(os.getenv("HEARTBEAT_INTERVAL", "1800")),
         "heartbeat_active_start": int(os.getenv("HEARTBEAT_ACTIVE_START", "9")),

@@ -86,10 +86,12 @@ python main.py --mode server --port 8877   # 自定义 Gateway 端口
 - 命名 Lane (main / cron / heartbeat)，FIFO 队列
 - WAL 写前日志投递队列，指数退避重试
 - 3 层重试：Auth 轮换 → 上下文压缩 → 工具调用循环
+- System Prompt 静态前缀缓存 + Anthropic prompt caching (cache_control)
+- 会话消息内存缓存 — 热路径零磁盘读取，仅冷启动加载
 - 心跳主动检查 (仅在活跃时段运行)
 - Cron 调度器 (at / every / cron 表达式)
 - 混合记忆搜索 (TF-IDF + 模拟向量)
-- 8 层 System Prompt 动态组装
+- 8 层 System Prompt 动态组装（静态前缀 + 动态后缀分离）
 - Skills 技能发现
 
 ### Gateway API
@@ -188,6 +190,16 @@ MODEL_ID=claude-sonnet-4-20250514
 # WORKWECHAT_BOT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 # WORKWECHAT_WS_URL=wss://openws.work.weixin.qq.com
 # WORKWECHAT_PING_INTERVAL_SEC=30
+
+# DingTalk (可选，见下方「钉钉接入」)
+# DINGTALK_MODE=long
+# DINGTALK_CLIENT_ID=dingxxxxxxxxxxxxxxxx
+# DINGTALK_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# DINGTALK_ACCESS_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
+# DINGTALK_SECRET=SECxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# DINGTALK_WEBHOOK_HOST=0.0.0.0
+# DINGTALK_WEBHOOK_PORT=8768
+# DINGTALK_WEBHOOK_PATH=/dingtalk/events
 
 # WeCom CLI (可选)
 # WECOM_CLI_TOOL_ENABLED=true      # 让模型可调用 wecom-cli 工具
@@ -330,6 +342,59 @@ WORKWECHAT_WEBHOOK_TOKEN=change-me
 ```
 
 说明：Webhook 模式当前接收标准化 JSON 事件，适合你已有企业微信 CLI/桥接进程时快速接入 tinyClaw。
+
+---
+
+## 钉钉接入
+
+当前支持两种模式：
+
+- long：钉钉 Stream 长连接（推荐）
+- webhook：回调模式
+
+### 长连接模式（推荐）
+
+先安装依赖：
+
+```sh
+pip install dingtalk-stream
+```
+
+配置示例：
+
+```sh
+# .env
+DINGTALK_MODE=long
+DINGTALK_CLIENT_ID=dingxxxxxxxxxxxxxxxx
+DINGTALK_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 出站发送可复用机器人 webhook 参数
+DINGTALK_ACCESS_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
+DINGTALK_SECRET=SECxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+### Webhook 模式
+
+- 入站：接收钉钉 webhook 回调
+- 出站：通过机器人 webhook 发送文本
+
+建议配置：
+
+```sh
+# .env
+DINGTALK_MODE=webhook
+DINGTALK_ACCESS_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
+DINGTALK_SECRET=SECxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+DINGTALK_WEBHOOK_HOST=0.0.0.0
+DINGTALK_WEBHOOK_PORT=8768
+DINGTALK_WEBHOOK_PATH=/dingtalk/events
+```
+
+如果你已经有完整 webhook URL，也可直接配置：
+
+```sh
+DINGTALK_WEBHOOK_URL=https://oapi.dingtalk.com/robot/send?access_token=xxxx
+```
 
 ### WeCom CLI 工具模式（推荐与长连接配合）
 

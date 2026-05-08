@@ -33,6 +33,7 @@ from tinyclaw import client, config
 from tinyclaw.agent.tools import ToolDispatcher
 from tinyclaw.channel import ChannelAccount, FeishuLongConnectionChannel
 from tinyclaw.channel.base import ChannelManager
+from tinyclaw.channel.dingtalk import DingTalkChannel, DingTalkLongConnectionChannel
 from tinyclaw.channel.feishu import FeishuChannel
 from tinyclaw.channel.wecom_cli import WeComCliChannel
 from tinyclaw.channel.telegram import TelegramChannel
@@ -42,7 +43,7 @@ from tinyclaw.delivery import DeliveryQueue, DeliveryRunner, chunk_message
 from tinyclaw.gateway import AgentConfig, AgentManager, Binding, BindingTable, GatewayServer
 from tinyclaw.gateway.routing import resolve_route
 from tinyclaw.gateway.server import get_event_loop
-from tinyclaw.intelligence import BootstrapLoader, MemoryStore, SkillsManager, build_system_prompt
+from tinyclaw.intelligence import BootstrapLoader, MemoryStore, SkillsManager, build_system_prompt, build_static_prefix
 from tinyclaw.intelligence.reminder import ReminderStore
 from tinyclaw.resilience import AuthProfile, ProfileManager, ResilienceRunner
 from tinyclaw.scheduler import CronService, HeartbeatRunner
@@ -282,6 +283,14 @@ def _build_workwechat_intro() -> str:
     )
 
 
+def _build_dingtalk_intro() -> str:
+    return (
+        "你好，我是 tinyClaw 助手。\n"
+        "我现在可以在钉钉中为你提供对话、记忆和提醒服务。\n\n"
+        "你可以直接用自然语言描述任务，我会尽量给出可执行结果。"
+    )
+
+
 def run_app(
     workspace: Path,
     cfg: dict[str, Any],
@@ -299,6 +308,17 @@ def run_app(
     skills_mgr = SkillsManager(workspace)
     skills_mgr.discover()
     reminder_store = ReminderStore(workspace)
+
+    # Cache static prompt parts once at startup — avoids file I/O and
+    # string formatting on every turn, and enables Anthropic prompt caching
+    # when the static prefix is passed as a cached content block.
+    _cached_bootstrap = bootstrap.load_all("full")
+    _cached_skills_block = skills_mgr.format_prompt_block()
+    _static_prefix = build_static_prefix(
+        mode="full",
+        bootstrap=_cached_bootstrap,
+        skills_block=_cached_skills_block,
+    )
 
     dispatcher = ToolDispatcher()
     dispatcher.register_builtin(workdir=workspace)
@@ -424,6 +444,11 @@ def run_app(
         save_session_map()
         return sid
 
+    # In-memory cache of latest messages[] per session.
+    # Avoids re-reading the full JSONL from disk on every turn.
+    # Key: session_id, Value: latest messages[] list.
+    session_cache: dict[str, list[dict]] = {}
+
     def append_session_delta(session_id: str, old_len: int, updated_messages: list[dict]) -> None:
         for msg in updated_messages[old_len:]:
             role = msg.get("role", "")
@@ -447,7 +472,13 @@ def run_app(
         account_id: str = "",
     ) -> str:
         session_id = get_session_id(session_key)
-        history = session_store.load_session(session_id)
+
+        # Use in-memory cache on warm path; only hit disk on cold start
+        if session_id in session_cache:
+            history = session_cache[session_id]
+        else:
+            history = session_store.load_session(session_id)
+            session_cache[session_id] = history
 
         search_text = user_text
         recent = _recent_user_texts(history)
@@ -465,15 +496,20 @@ def run_app(
         else:
             mem_ctx = ""
 
+        # Build system prompt: static prefix (cached once) + dynamic suffix
         system_prompt = build_system_prompt(
             mode="full",
-            bootstrap=bootstrap.load_all("full"),
-            skills_block=skills_mgr.format_prompt_block(),
             memory_context=mem_ctx,
             agent_id=agent_id,
             channel=channel,
             model=model_id,
+            static_prefix=_static_prefix,
         )
+        # Wrap as content blocks so Anthropic can cache the static prefix
+        system_blocks = [
+            {"type": "text", "text": _static_prefix, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": system_prompt[len(_static_prefix):]},
+        ]
 
         messages = list(history)
         old_len = len(messages)
@@ -482,14 +518,22 @@ def run_app(
         token = TURN_CONTEXT.set({"channel": channel, "peer_id": peer_id, "account_id": account_id})
         try:
             response, updated = resilience.run(
-                system=system_prompt,
+                system=system_blocks,
                 messages=messages,
                 tools=dispatcher.tools,
                 tool_handler=dispatcher.dispatch,
             )
+        except Exception:
+            # API call failed — the messages list may be in a dirty state.
+            # Evict from cache so the next turn reloads from disk.
+            session_cache.pop(session_id, None)
+            raise
         finally:
             TURN_CONTEXT.reset(token)
         append_session_delta(session_id, old_len, updated)
+
+        # Update cache with the latest messages (including this turn)
+        session_cache[session_id] = updated
 
         return _extract_assistant_text(response)
 
@@ -587,6 +631,61 @@ def run_app(
         except Exception as exc:
             print_warn(f"Work WeChat Webhook 启动失败: {exc}")
 
+    dingtalk_channel: DingTalkChannel | None = None
+    dingtalk_long: DingTalkLongConnectionChannel | None = None
+    dingtalk_sender: Any = None
+    dingtalk_mode = str(cfg.get("dingtalk_mode", "off")).strip().lower() if server_mode else "off"
+    if dingtalk_mode not in ("long", "webhook", "off"):
+        dingtalk_mode = "off"
+    if dingtalk_mode == "long":
+        dd_client_id = cfg.get("dingtalk_client_id", "")
+        dd_client_secret = cfg.get("dingtalk_client_secret", "")
+        if dd_client_id and dd_client_secret:
+            dd_account = ChannelAccount(
+                channel="dingtalk",
+                account_id="dingtalk-default",
+                config={
+                    "client_id": dd_client_id,
+                    "client_secret": dd_client_secret,
+                    "access_token": cfg.get("dingtalk_access_token", ""),
+                    "secret": cfg.get("dingtalk_secret", ""),
+                    "webhook_url": cfg.get("dingtalk_webhook_url", ""),
+                    "api_base": cfg.get("dingtalk_api_base", "https://oapi.dingtalk.com"),
+                },
+            )
+            try:
+                dingtalk_long = DingTalkLongConnectionChannel(dd_account)
+                dingtalk_long.start()
+                ch_mgr.register_async(dingtalk_long)
+                dingtalk_sender = dingtalk_long
+                bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="dingtalk", priority=94))
+                print_info("DingTalk 长连接模式已启用")
+            except Exception as exc:
+                print_warn(f"DingTalk 长连接启动失败: {exc}")
+    elif dingtalk_mode == "webhook":
+        dd_access_token = cfg.get("dingtalk_access_token", "")
+        dd_webhook_url = cfg.get("dingtalk_webhook_url", "")
+        if dd_access_token or dd_webhook_url:
+            dd_account = ChannelAccount(
+                channel="dingtalk",
+                account_id="dingtalk-default",
+                config={
+                    "access_token": dd_access_token,
+                    "secret": cfg.get("dingtalk_secret", ""),
+                    "webhook_url": dd_webhook_url,
+                    "api_base": cfg.get("dingtalk_api_base", "https://oapi.dingtalk.com"),
+                    "webhook_token": cfg.get("dingtalk_webhook_token", ""),
+                },
+            )
+            try:
+                dingtalk_channel = DingTalkChannel(dd_account)
+                ch_mgr.register(dingtalk_channel)
+                dingtalk_sender = dingtalk_channel
+                bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="dingtalk", priority=94))
+                print_info("DingTalk Webhook 模式已启用")
+            except Exception as exc:
+                print_warn(f"DingTalk 通道启动失败: {exc}")
+
     feishu_mode = str(cfg.get("feishu_mode", "both")).strip().lower() if server_mode else "off"
     if feishu_mode not in ("long", "webhook", "both", "off"):
         feishu_mode = "both"
@@ -672,6 +771,8 @@ def run_app(
         enabled_channels.append("feishu")
     if workwechat_sender:
         enabled_channels.append("workwechat")
+    if dingtalk_sender:
+        enabled_channels.append("dingtalk")
 
     registered_tools = dispatcher.list_tools()
 
@@ -695,6 +796,10 @@ def run_app(
         if channel == "workwechat" and workwechat_sender:
             if not workwechat_sender.send(to, text, reply_req_id=meta.get("reply_req_id", "")):
                 raise RuntimeError("workwechat send failed")
+            return
+        if channel == "dingtalk" and dingtalk_sender:
+            if not dingtalk_sender.send(to, text):
+                raise RuntimeError("dingtalk send failed")
             return
         print_warn(f"未知投递通道: {channel}")
 
@@ -769,6 +874,11 @@ def run_app(
                     _build_workwechat_intro(),
                     meta={"reply_req_id": reply_req_id} if reply_req_id else None,
                 )
+            return
+
+        if msg.channel == "dingtalk" and msg.text == "__dingtalk_session_started__":
+            if dingtalk_sender and msg.peer_id:
+                delivery_queue.enqueue("dingtalk", msg.peer_id, _build_dingtalk_intro())
             return
 
         if msg.channel == "feishu":
@@ -907,6 +1017,8 @@ def run_app(
     webhook_thread: threading.Thread | None = None
     workwechat_webhook_server: ThreadingHTTPServer | None = None
     workwechat_webhook_thread: threading.Thread | None = None
+    dingtalk_webhook_server: ThreadingHTTPServer | None = None
+    dingtalk_webhook_thread: threading.Thread | None = None
 
     if server_mode and feishu_webhook and feishu_mode in ("webhook", "both"):
         webhook_host = cfg.get("feishu_webhook_host", "0.0.0.0")
@@ -1003,6 +1115,53 @@ def run_app(
         workwechat_webhook_thread.start()
         print_info(f"Work WeChat Webhook 已启动: http://{ww_webhook_host}:{ww_webhook_port}{ww_webhook_path}")
 
+    if server_mode and dingtalk_channel and dingtalk_mode == "webhook":
+        dd_webhook_host = cfg.get("dingtalk_webhook_host", "0.0.0.0")
+        dd_webhook_port = int(cfg.get("dingtalk_webhook_port", 8768))
+        dd_webhook_path = str(cfg.get("dingtalk_webhook_path", "/dingtalk/events"))
+
+        class DingTalkWebhookHandler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                if self.path != dd_webhook_path:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
+                token = self.headers.get("X-Webhook-Token", "") or payload.get("token", "")
+                inbound = dingtalk_channel.parse_event(payload, token=token)
+                if inbound is not None:
+                    inbound_queue.put(inbound)
+                data = b'{"code":0}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, format, *args):  # noqa: A003
+                return
+
+        dingtalk_webhook_server = ThreadingHTTPServer(
+            (dd_webhook_host, dd_webhook_port),
+            DingTalkWebhookHandler,
+        )
+        dingtalk_webhook_thread = threading.Thread(
+            target=dingtalk_webhook_server.serve_forever,
+            daemon=True,
+            name="dingtalk-webhook",
+        )
+        dingtalk_webhook_thread.start()
+        print_info(f"DingTalk Webhook 已启动: http://{dd_webhook_host}:{dd_webhook_port}{dd_webhook_path}")
+
     def inbound_worker() -> None:
         while not stop_event.is_set():
             try:
@@ -1023,6 +1182,7 @@ def run_app(
         print_info(f"  Gateway: ws://{gateway_host}:{gateway_port}")
         print_info(f"  飞书模式: {feishu_mode}")
         print_info(f"  企业微信模式: {workwechat_mode}")
+        print_info(f"  钉钉模式: {dingtalk_mode}")
         print_info("  运行中：多渠道服务 + Gateway + 后台任务")
     else:
         print_info("  命令: /help, /status, /cron, /reminder, /memory, /queue, /lanes, /trigger")
@@ -1164,6 +1324,12 @@ def run_app(
             workwechat_webhook_server.server_close()
             if workwechat_webhook_thread and workwechat_webhook_thread.is_alive():
                 workwechat_webhook_thread.join(timeout=2.0)
+
+        if dingtalk_webhook_server:
+            dingtalk_webhook_server.shutdown()
+            dingtalk_webhook_server.server_close()
+            if dingtalk_webhook_thread and dingtalk_webhook_thread.is_alive():
+                dingtalk_webhook_thread.join(timeout=2.0)
 
         if pump_future:
             pump_future.cancel()

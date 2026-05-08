@@ -13,8 +13,12 @@ The project has two parallel structures:
 ## Common Commands
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies (uv is the only package manager — no requirements.txt)
+uv sync
+
+# Optional extras
+uv sync --extra dev        # pytest + ruff
+uv sync --extra telegram   # python-telegram-bot
 
 # Configure environment
 cp .env.example .env
@@ -26,9 +30,9 @@ python sessions/zh/s02_tool_use.py
 # ... through s10_concurrency.py
 
 # Run production project
-python main.py --mode cli       # Simple REPL
-python main.py --mode full      # Full features (heartbeat + cron + delivery + concurrency)
-python main.py --mode gateway   # WebSocket gateway (port 8765)
+python main.py --mode cli       # CLI REPL with /status, /cron, /lanes, etc.
+python main.py --mode server    # Multi-channel + gateway + background tasks (heartbeat/cron/delivery)
+python main.py --mode server --port 8877   # Custom gateway WebSocket port
 ```
 
 ## Architecture
@@ -39,9 +43,9 @@ The project builds an AI Agent Gateway layer by layer:
 s01: Agent Loop      - while True + stop_reason (the foundation)
 s02: Tool Use       - dispatch table for model-called tools
 s03: Sessions       - JSONL persistence, context overflow handling
-s04: Channels       - Telegram + Feishu adapters
+s04: Channels       - Telegram / Feishu / WorkWeChat / DingTalk / WeCom CLI adapters
 s05: Gateway        - 5-tier routing, session isolation
-s06: Intelligence   - soul, memory, skills, 8-layer prompt assembly
+s06: Intelligence   - soul, memory, skills, 8-layer prompt assembly, reminders
 s07: Heartbeat      - proactive agent + cron scheduler
 s08: Delivery       - write-ahead queue with backoff
 s09: Resilience     - 3-layer retry, auth profile rotation
@@ -57,25 +61,45 @@ Section dependencies:
 
 ```
 src/tinyclaw/
-├── config.py           # .env configuration loading
+├── config.py           # .env configuration loading (all channel env vars)
 ├── client.py           # Anthropic client factory
-├── utils/              # ANSI colors, helpers
-├── agent/              # Agent loop + tool dispatcher
+├── utils/              # ANSI colors, timezone (Beijing time formatting)
+├── agent/              # Agent loop + ToolDispatcher (register_builtin + register)
 ├── session/            # JSONL store + context guard
-├── channel/            # CLI / Telegram / Feishu adapters
-├── gateway/            # 5-tier routing + WebSocket server
-├── intelligence/       # soul / memory / skills / prompt builder
+├── channel/            # Telegram / Feishu / WorkWeChat / DingTalk / WeComCLI adapters
+├── gateway/            # 5-tier BindingTable routing + WebSocket JSON-RPC server
+├── intelligence/       # soul / memory / skills / prompt builder / reminder store
 ├── scheduler/          # heartbeat + cron
-├── delivery/           # WAL queue + runner
-├── resilience/         # 3-layer retry + auth rotation
-└── concurrency/       # named FIFO lanes
+├── delivery/           # WAL queue + chunker + runner
+├── resilience/         # 3-layer retry (ResilienceRunner) + auth rotation
+└── concurrency/        # named FIFO lanes (CommandQueue)
 ```
 
 ## Key Patterns
 
 - **Agent Loop**: `messages[]` accumulates history, `stop_reason` controls flow (`end_turn` vs `tool_use`)
-- **Tool Dispatch**: schema dict + handler map; model picks name, code looks it up
-- **Session Storage**: JSONL append-only, replay on read, summarize for overflow
-- **Channel Abstraction**: All platforms produce standardized `InboundMessage`
-- **Prompt Assembly**: 8-layer stack (soul, identity, tools, etc.) merged from disk files
-- **Named Lanes**: Concurrency isolation via FIFO queues per (channel, peer) pair
+- **Tool Dispatch**: `ToolDispatcher` with `register_builtin()` for built-in tools + `register()` for custom tools; model picks name, dispatcher looks up handler
+- **Session Storage**: JSONL append-only, replay on read, summarize for overflow. Session keys are persisted in `session_key_map.json`. Hot path uses in-memory cache (`session_cache` dict) — disk is only read on cold start
+- **Channel Abstraction**: All platforms produce standardized `InboundMessage` via `ChannelManager`. Async channels (Feishu long connection, WorkWeChat long connection, DingTalk long connection) use `register_async()`; sync channels (Telegram polling, WeCom CLI polling, webhooks) use `register()`
+- **Prompt Assembly**: 8-layer stack built via `build_static_prefix()` (Layers 1-6, cached at startup) + dynamic suffix (memory context, runtime context, channel hints). Static prefix is passed as a `cache_control`-marked content block to enable Anthropic prompt caching
+- **Prompt Caching**: `_static_prefix` is built once at startup and never changes across turns. It's wrapped in `{"type": "text", "text": ..., "cache_control": {"type": "ephemeral"}}` and passed to the API as a content block list, allowing the LLM provider to cache KV states and skip prefill on subsequent turns
+- **Named Lanes**: Concurrency isolation via FIFO queues per `(channel, peer)` pair, managed by `CommandQueue` with `LANE_MAIN`, `LANE_CRON`, `LANE_HEARTBEAT`
+- **Run Modes**: `--mode cli` (single-user REPL, stdin/stdout) vs `--mode server` (all channels active, background threads for heartbeat/cron/delivery/reminder-check)
+- **Reminder System**: `ReminderStore` persists reminders to workspace, `reminder_check_loop` polls and enqueues due reminders to delivery. Model can call `reminder_write`/`reminder_list` tools
+- **Timezone**: All user-facing time is formatted to Beijing time (UTC+8) via `utils/timezone.py`
+
+## Run Mode Differences
+
+| Feature | `--mode cli` | `--mode server` |
+|---|---|---|
+| CLI REPL | Yes | No |
+| Telegram polling | No | Yes (if token configured) |
+| Feishu long connection / webhook | No | Yes (if configured) |
+| WorkWeChat long connection / webhook | No | Yes (if configured) |
+| DingTalk long connection / webhook | No | Yes (if configured) |
+| WeCom CLI polling | No | Yes (if poll enabled) |
+| WebSocket gateway | No | Yes |
+| Heartbeat + Cron | No | Yes |
+| Delivery queue | Yes (console only) | Yes (all channels) |
+| Reminder check loop | Yes (console only) | Yes (all channels) |
+| WeCom CLI as callable tool | Yes | Yes |

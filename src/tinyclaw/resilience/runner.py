@@ -84,7 +84,7 @@ class ResilienceRunner:
 
     def run(
         self,
-        system: str,
+        system: str | list[dict],
         messages: list[dict],
         tools: list[dict],
         tool_handler: Any,  # (name, input_dict) -> str
@@ -185,7 +185,7 @@ class ResilienceRunner:
         self,
         api_client: Anthropic,
         model: str,
-        system: str,
+        system: str | list[dict],
         messages: list[dict],
         tools: list[dict],
         tool_handler: Any,

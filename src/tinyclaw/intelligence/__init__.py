@@ -4,9 +4,9 @@ from tinyclaw.intelligence.bootstrap import BootstrapLoader
 from tinyclaw.intelligence.soul import SoulSystem
 from tinyclaw.intelligence.memory import MemoryStore
 from tinyclaw.intelligence.skills import SkillsManager
-from tinyclaw.intelligence.prompt_builder import build_system_prompt
+from tinyclaw.intelligence.prompt_builder import build_system_prompt, build_static_prefix
 
 __all__ = [
     "BootstrapLoader", "SoulSystem", "MemoryStore",
-    "SkillsManager", "build_system_prompt",
+    "SkillsManager", "build_system_prompt", "build_static_prefix",
 ]

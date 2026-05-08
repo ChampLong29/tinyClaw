@@ -9,6 +9,10 @@ The system prompt is assembled from these layers (in order):
   6. Bootstrap (HEARTBEAT.md, BOOTSTRAP.md, AGENTS.md, USER.md)
   7. Runtime Context (agent_id, model, channel, time)
   8. Channel Hints (channel-specific formatting guidance)
+
+For prompt caching, the static prefix (Layers 1-6) is pre-built once and
+reused across turns. Only the dynamic suffix (memory recall, runtime context,
+channel hints) is rebuilt each turn.
 """
 
 from __future__ import annotations
@@ -17,25 +21,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-def build_system_prompt(
+def build_static_prefix(
     mode: str = "full",
     bootstrap: dict[str, str] | None = None,
     skills_block: str = "",
-    memory_context: str = "",
-    agent_id: str = "main",
-    channel: str = "terminal",
-    model: str = "",
 ) -> str:
-    """Build the complete system prompt from layers.
+    """Build the static, cacheable prefix of the system prompt (Layers 1-6).
 
-    Args:
-        mode: "full" (main agent) | "minimal" (sub-agent/cron) | "none"
-        bootstrap: {filename: content} from BootstrapLoader
-        skills_block: Formatted skills block from SkillsManager
-        memory_context: Auto-recalled memories from hybrid search
-        agent_id: Current agent identifier
-        channel: Current channel name (terminal, telegram, discord, etc.)
-        model: Model identifier for runtime context
+    This prefix is identical across turns for the same agent configuration,
+    making it eligible for Anthropic's prompt caching when passed as a
+    content block with cache_control.
+
+    Excludes: memory_context (changes per turn), runtime context (time changes),
+    channel hints (may vary per turn).
     """
     if bootstrap is None:
         bootstrap = {}
@@ -60,14 +58,12 @@ def build_system_prompt(
     if mode == "full" and skills_block:
         sections.append(skills_block)
 
-    # Layer 5: Memory
+    # Layer 5: Memory (evergreen + instructions only, no dynamic recall)
     if mode == "full":
         mem_md = bootstrap.get("MEMORY.md", "").strip()
         parts: list[str] = []
         if mem_md:
             parts.append(f"### Evergreen Memory\n\n{mem_md}")
-        if memory_context:
-            parts.append(f"### Recalled Memories (auto-searched)\n\n{memory_context}")
         if parts:
             sections.append("## Memory\n\n" + "\n\n".join(parts))
         sections.append(
@@ -83,6 +79,96 @@ def build_system_prompt(
             content = bootstrap.get(name, "").strip()
             if content:
                 sections.append(f"## {name.replace('.md', '')}\n\n{content}")
+
+    return "\n\n".join(sections)
+
+
+def build_system_prompt(
+    mode: str = "full",
+    bootstrap: dict[str, str] | None = None,
+    skills_block: str = "",
+    memory_context: str = "",
+    agent_id: str = "main",
+    channel: str = "terminal",
+    model: str = "",
+    static_prefix: str | None = None,
+) -> str:
+    """Build the complete system prompt from layers.
+
+    When static_prefix is provided, Layers 1-6 are skipped and only the
+    dynamic suffix (memory recall, runtime context, channel hints) is appended.
+    This enables prompt caching when the caller builds static_prefix once
+    and passes it as a cached content block.
+
+    Args:
+        mode: "full" (main agent) | "minimal" (sub-agent/cron) | "none"
+        bootstrap: {filename: content} from BootstrapLoader
+        skills_block: Formatted skills block from SkillsManager
+        memory_context: Auto-recalled memories from hybrid search
+        agent_id: Current agent identifier
+        channel: Current channel name (terminal, telegram, feishu, etc.)
+        model: Model identifier for runtime context
+        static_prefix: Pre-built static prefix from build_static_prefix().
+            When provided, Layers 1-6 are skipped.
+    """
+    if bootstrap is None:
+        bootstrap = {}
+
+    if static_prefix is not None:
+        # Fast path: only append dynamic layers
+        sections: list[str] = [static_prefix]
+
+        # Recalled memories from hybrid search (dynamic)
+        if mode == "full" and memory_context:
+            sections.append(f"## Recalled Memories (auto-searched)\n\n{memory_context}")
+    else:
+        # Full build from scratch (backward-compatible)
+        sections: list[str] = []
+
+        # Layer 1: Identity
+        identity = bootstrap.get("IDENTITY.md", "").strip()
+        sections.append(identity if identity else "You are a helpful personal AI assistant.")
+
+        # Layer 2: Soul (personality)
+        if mode == "full":
+            soul = bootstrap.get("SOUL.md", "").strip()
+            if soul:
+                sections.append(f"## Personality\n\n{soul}")
+
+        # Layer 3: Tool guidelines
+        tools_md = bootstrap.get("TOOLS.md", "").strip()
+        if tools_md:
+            sections.append(f"## Tool Usage Guidelines\n\n{tools_md}")
+
+        # Layer 4: Skills
+        if mode == "full" and skills_block:
+            sections.append(skills_block)
+
+        # Layer 5: Memory
+        if mode == "full":
+            mem_md = bootstrap.get("MEMORY.md", "").strip()
+            parts: list[str] = []
+            if mem_md:
+                parts.append(f"### Evergreen Memory\n\n{mem_md}")
+            if memory_context:
+                parts.append(f"### Recalled Memories (auto-searched)\n\n{memory_context}")
+            if parts:
+                sections.append("## Memory\n\n" + "\n\n".join(parts))
+            sections.append(
+                "## Memory Instructions\n\n"
+                "- Use memory_write to save important user facts and preferences.\n"
+                "- Reference remembered facts naturally in conversation.\n"
+                "- Use memory_search to recall specific past information."
+            )
+
+        # Layer 6: Bootstrap files
+        if mode in ("full", "minimal"):
+            for name in ["HEARTBEAT.md", "BOOTSTRAP.md", "AGENTS.md", "USER.md"]:
+                content = bootstrap.get(name, "").strip()
+                if content:
+                    sections.append(f"## {name.replace('.md', '')}\n\n{content}")
+
+    # --- Dynamic layers (always appended, even with static_prefix) ---
 
     # Layer 7: Runtime context
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
