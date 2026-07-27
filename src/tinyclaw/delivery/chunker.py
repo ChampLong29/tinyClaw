@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 CHANNEL_LIMITS: dict[str, int] = {
     "telegram": 4096,
     "telegram_caption": 1024,

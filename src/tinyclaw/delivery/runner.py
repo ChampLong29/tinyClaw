@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable
 
-from tinyclaw.delivery.queue import DeliveryQueue, MAX_RETRIES, compute_backoff_ms
+from tinyclaw.delivery.queue import DeliveryQueue
 
 
 class DeliveryRunner:

@@ -1,10 +1,29 @@
-"""Delivery module: reliable message delivery with WAL."""
+"""Reliable delivery with legacy file WAL and transactional SQLite lanes."""
 
+from tinyclaw.delivery.chunker import CHANNEL_LIMITS, chunk_message
 from tinyclaw.delivery.queue import DeliveryQueue, QueuedDelivery, compute_backoff_ms
+from tinyclaw.delivery.retry import DeliveryRetryPolicy
 from tinyclaw.delivery.runner import DeliveryRunner
-from tinyclaw.delivery.chunker import chunk_message, CHANNEL_LIMITS
+from tinyclaw.delivery.store import (
+    DeliveryIdempotencyConflictError,
+    DeliveryLeaseConflictError,
+    DeliveryNotFoundError,
+    SQLiteDeliveryStore,
+)
+from tinyclaw.delivery.worker import DeliveryReceipt, LeaseDeliveryWorker
 
 __all__ = [
-    "DeliveryQueue", "QueuedDelivery", "compute_backoff_ms",
-    "DeliveryRunner", "chunk_message", "CHANNEL_LIMITS",
+    "CHANNEL_LIMITS",
+    "DeliveryIdempotencyConflictError",
+    "DeliveryLeaseConflictError",
+    "DeliveryNotFoundError",
+    "DeliveryQueue",
+    "DeliveryReceipt",
+    "DeliveryRetryPolicy",
+    "DeliveryRunner",
+    "LeaseDeliveryWorker",
+    "QueuedDelivery",
+    "SQLiteDeliveryStore",
+    "chunk_message",
+    "compute_backoff_ms",
 ]

@@ -7,7 +7,6 @@ Agent loop only sees InboundMessage -- platform differences are encapsulated.
 from __future__ import annotations
 
 import asyncio
-import queue
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,7 +14,11 @@ from typing import Any
 
 @dataclass
 class InboundMessage:
-    """Standardized inbound message from any channel."""
+    """Legacy channel DTO.
+
+    New gateway code should call :meth:`to_envelope` at the channel boundary.
+    The DTO remains stable while adapters migrate to ``InboundEnvelope``.
+    """
     text: str
     sender_id: str
     channel: str = ""
@@ -24,6 +27,12 @@ class InboundMessage:
     is_group: bool = False
     media: list = field(default_factory=list)
     raw: dict = field(default_factory=dict)
+
+    def to_envelope(self, *, raw_artifact_ref: str | None = None):
+        """Convert to the versioned, platform-neutral inbound contract."""
+        from tinyclaw.contracts.envelope import inbound_message_to_envelope
+
+        return inbound_message_to_envelope(self, raw_artifact_ref=raw_artifact_ref)
 
 
 @dataclass
