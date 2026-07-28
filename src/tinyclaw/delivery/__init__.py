@@ -1,6 +1,12 @@
 """Reliable delivery with legacy file WAL and transactional SQLite lanes."""
 
 from tinyclaw.delivery.chunker import CHANNEL_LIMITS, chunk_message
+from tinyclaw.delivery.durable import (
+    DurableDeliveryQueue,
+    DurableDeliveryRunner,
+    LegacyDeliveryMigrator,
+    LegacyMigrationReport,
+)
 from tinyclaw.delivery.queue import DeliveryQueue, QueuedDelivery, compute_backoff_ms
 from tinyclaw.delivery.retry import DeliveryRetryPolicy
 from tinyclaw.delivery.runner import DeliveryRunner
@@ -21,6 +27,10 @@ __all__ = [
     "DeliveryReceipt",
     "DeliveryRetryPolicy",
     "DeliveryRunner",
+    "DurableDeliveryQueue",
+    "DurableDeliveryRunner",
+    "LegacyDeliveryMigrator",
+    "LegacyMigrationReport",
     "LeaseDeliveryWorker",
     "QueuedDelivery",
     "SQLiteDeliveryStore",

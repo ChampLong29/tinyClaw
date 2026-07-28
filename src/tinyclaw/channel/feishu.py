@@ -11,12 +11,18 @@ import json
 import queue
 import threading
 import time
-from typing import Any
 
-from tinyclaw.channel.base import AsyncChannel, Channel, InboundMessage, ChannelAccount
+from tinyclaw.channel.base import (
+    AsyncChannel,
+    Channel,
+    ChannelAccount,
+    ChannelSendResult,
+    InboundMessage,
+)
 
 try:
     import httpx
+
     HAS_HTTPX = True
 except ImportError:
     HAS_HTTPX = False
@@ -36,8 +42,11 @@ class FeishuChannel(Channel):
         self._encrypt_key = account.config.get("encrypt_key", "")
         self._bot_open_id = account.config.get("bot_open_id", "")
         is_lark = account.config.get("is_lark", False)
-        self.api_base = ("https://open.larksuite.com/open-apis" if is_lark
-                         else "https://open.feishu.cn/open-apis")
+        self.api_base = (
+            "https://open.larksuite.com/open-apis"
+            if is_lark
+            else "https://open.feishu.cn/open-apis"
+        )
         self._tenant_token: str = ""
         self._token_expires_at: float = 0.0
         self._http = httpx.Client(timeout=15.0)
@@ -132,10 +141,14 @@ class FeishuChannel(Channel):
             return None
 
         return InboundMessage(
-            text=text, sender_id=user_id, channel="feishu",
+            text=text,
+            sender_id=user_id,
+            channel="feishu",
             account_id=self.account_id,
             peer_id=user_id if chat_type == "p2p" else chat_id,
-            media=media, is_group=is_group, raw=payload,
+            media=media,
+            is_group=is_group,
+            raw=payload,
         )
 
     def parse_session_event(self, payload: dict) -> InboundMessage | None:
@@ -168,23 +181,36 @@ class FeishuChannel(Channel):
         return None
 
     def send(self, to: str, text: str, **kwargs) -> bool:
+        return self.send_with_receipt(to, text, **kwargs).accepted
+
+    def send_with_receipt(self, to: str, text: str, **kwargs) -> ChannelSendResult:
         token = self._refresh_token()
         if not token:
-            return False
+            return ChannelSendResult(accepted=False)
         try:
             resp = self._http.post(
                 f"{self.api_base}/im/v1/messages",
                 params={"receive_id_type": "chat_id"},
                 headers={"Authorization": f"Bearer {token}"},
-                json={"receive_id": to, "msg_type": "text",
-                      "content": json.dumps({"text": text})},
+                json={
+                    "receive_id": to,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": text}),
+                },
             )
             data = resp.json()
             if data.get("code") != 0:
-                return False
-            return True
+                return ChannelSendResult(accepted=False)
+            message_id = str(data.get("data", {}).get("message_id", "")).strip()
+            if message_id:
+                return ChannelSendResult(
+                    accepted=True,
+                    platform_message_id=message_id,
+                    confirmed=True,
+                )
+            return ChannelSendResult(accepted=True)
         except Exception:
-            return False
+            return ChannelSendResult(accepted=False)
 
     def close(self) -> None:
         self._http.close()
@@ -223,15 +249,18 @@ class FeishuLongConnectionChannel(AsyncChannel):
         self,
         account: ChannelAccount,
         gw_event_loop_getter,  # callable -> asyncio.AbstractEventLoop
-        gw_send_fn,           # async (peer_id, text) -> None
+        gw_send_fn,  # async (peer_id, text) -> None
     ) -> None:
         self.account_id = account.account_id
         self.app_id = account.config.get("app_id", "")
         self.app_secret = account.config.get("app_secret", "")
         self._bot_open_id = account.config.get("bot_open_id", "")
         is_lark = account.config.get("is_lark", False)
-        self.api_base = ("https://open.larksuite.com/open-apis" if is_lark
-                         else "https://open.feishu.cn/open-apis")
+        self.api_base = (
+            "https://open.larksuite.com/open-apis"
+            if is_lark
+            else "https://open.feishu.cn/open-apis"
+        )
         self._gw_loop_getter = gw_event_loop_getter
         self._gw_send = gw_send_fn
 
@@ -258,8 +287,8 @@ class FeishuLongConnectionChannel(AsyncChannel):
         # All lark_oapi imports must happen here (before gateway's asyncio.run()
         # starts). Otherwise the module-level get_event_loop() captures the
         # running gateway loop.
-        from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
         import lark_oapi.api.im.v1 as im_v1
+        from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 
         P2ImMessageReceiveV1 = im_v1.P2ImMessageReceiveV1
         P2ImChatAccessEventBotP2pChatEnteredV1 = im_v1.P2ImChatAccessEventBotP2pChatEnteredV1
@@ -275,7 +304,9 @@ class FeishuLongConnectionChannel(AsyncChannel):
                 raw_content = getattr(message, "content", "{}")
 
                 try:
-                    content = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+                    content = (
+                        json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+                    )
                 except (json.JSONDecodeError, TypeError):
                     content = {}
 
@@ -300,11 +331,16 @@ class FeishuLongConnectionChannel(AsyncChannel):
                     return
 
                 # Yield as InboundMessage for ChannelManager to pick up
-                self._msg_queue.put(InboundMessage(
-                    text=text, sender_id=user_id,
-                    channel="feishu", account_id=self.account_id,
-                    peer_id=peer_id, is_group=is_group,
-                ))
+                self._msg_queue.put(
+                    InboundMessage(
+                        text=text,
+                        sender_id=user_id,
+                        channel="feishu",
+                        account_id=self.account_id,
+                        peer_id=peer_id,
+                        is_group=is_group,
+                    )
+                )
 
                 # Also delegate send to gateway's event loop
                 async def _deliver():
@@ -335,18 +371,20 @@ class FeishuLongConnectionChannel(AsyncChannel):
                 header = getattr(event, "header", None)
                 event_id = getattr(header, "event_id", "") if header else ""
 
-                self._msg_queue.put(InboundMessage(
-                    text="__feishu_session_started__",
-                    sender_id=sender_id,
-                    channel="feishu",
-                    account_id=self.account_id,
-                    peer_id=chat_id,
-                    is_group=False,
-                    raw={
-                        "event_type": "p2.im.chat.access_event.bot_p2p_chat_entered_v1",
-                        "event_id": event_id,
-                    },
-                ))
+                self._msg_queue.put(
+                    InboundMessage(
+                        text="__feishu_session_started__",
+                        sender_id=sender_id,
+                        channel="feishu",
+                        account_id=self.account_id,
+                        peer_id=chat_id,
+                        is_group=False,
+                        raw={
+                            "event_type": "p2.im.chat.access_event.bot_p2p_chat_entered_v1",
+                            "event_id": event_id,
+                        },
+                    )
+                )
             except Exception as exc:
                 print(f"[feishu] 会话创建事件处理异常: {exc}")
 
@@ -388,9 +426,12 @@ class FeishuLongConnectionChannel(AsyncChannel):
                 handler._processorMap[_event_key] = _Processor(on_noop, _cls)
 
         from lark_oapi.ws import Client as FeishuWSClient
-        domain = ("https://open.feishu.cn"
-                  if self.api_base == "https://open.feishu.cn/open-apis"
-                  else "https://open.larksuite.com")
+
+        domain = (
+            "https://open.feishu.cn"
+            if self.api_base == "https://open.feishu.cn/open-apis"
+            else "https://open.larksuite.com"
+        )
         ws_client = FeishuWSClient(
             app_id=self.app_id,
             app_secret=self.app_secret,
@@ -399,7 +440,7 @@ class FeishuLongConnectionChannel(AsyncChannel):
             auto_reconnect=True,
         )
 
-        print(f"[gateway] 飞书长连接已启动（无需 ngrok）")
+        print("[gateway] 飞书长连接已启动（无需 ngrok）")
         ws_client.start()
 
     def _refresh_token(self) -> str:
@@ -420,23 +461,36 @@ class FeishuLongConnectionChannel(AsyncChannel):
             return ""
 
     def send(self, to: str, text: str, **kwargs) -> bool:
+        return self.send_with_receipt(to, text, **kwargs).accepted
+
+    def send_with_receipt(self, to: str, text: str, **kwargs) -> ChannelSendResult:
         token = self._refresh_token()
         if not token:
-            return False
+            return ChannelSendResult(accepted=False)
         try:
             resp = self._http.post(
                 f"{self.api_base}/im/v1/messages",
                 params={"receive_id_type": "chat_id"},
                 headers={"Authorization": f"Bearer {token}"},
-                json={"receive_id": to, "msg_type": "text",
-                      "content": json.dumps({"text": text})},
+                json={
+                    "receive_id": to,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": text}),
+                },
             )
             data = resp.json()
             if data.get("code") != 0:
-                return False
-            return True
+                return ChannelSendResult(accepted=False)
+            message_id = str(data.get("data", {}).get("message_id", "")).strip()
+            if message_id:
+                return ChannelSendResult(
+                    accepted=True,
+                    platform_message_id=message_id,
+                    confirmed=True,
+                )
+            return ChannelSendResult(accepted=True)
         except Exception:
-            return False
+            return ChannelSendResult(accepted=False)
 
     async def receive_all(self):
         """Async iterator: yields InboundMessage as they arrive."""
@@ -454,4 +508,3 @@ class FeishuLongConnectionChannel(AsyncChannel):
         self._http.close()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
-

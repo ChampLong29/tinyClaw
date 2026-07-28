@@ -16,7 +16,6 @@ import asyncio
 import concurrent.futures
 import contextvars
 import json
-import os
 import queue
 import subprocess
 import sys
@@ -35,16 +34,42 @@ from tinyclaw.channel import ChannelAccount, FeishuLongConnectionChannel
 from tinyclaw.channel.base import ChannelManager
 from tinyclaw.channel.dingtalk import DingTalkChannel, DingTalkLongConnectionChannel
 from tinyclaw.channel.feishu import FeishuChannel
-from tinyclaw.channel.wecom_cli import WeComCliChannel
 from tinyclaw.channel.telegram import TelegramChannel
+from tinyclaw.channel.wecom_cli import WeComCliChannel
 from tinyclaw.channel.workwechat import WorkWeChatChannel, WorkWeChatLongConnectionChannel
-from tinyclaw.concurrency import CommandQueue, LANE_CRON, LANE_HEARTBEAT, LANE_MAIN
-from tinyclaw.delivery import DeliveryQueue, DeliveryRunner, chunk_message
+from tinyclaw.concurrency import LANE_CRON, LANE_HEARTBEAT, LANE_MAIN, CommandQueue
+from tinyclaw.delivery import (
+    DeliveryReceipt,
+    DurableDeliveryQueue,
+    DurableDeliveryRunner,
+    LegacyDeliveryMigrator,
+    SQLiteDeliveryStore,
+    chunk_message,
+)
 from tinyclaw.gateway import AgentConfig, AgentManager, Binding, BindingTable, GatewayServer
 from tinyclaw.gateway.routing import resolve_route
 from tinyclaw.gateway.server import get_event_loop
-from tinyclaw.intelligence import BootstrapLoader, MemoryStore, SkillsManager, build_system_prompt, build_static_prefix
+from tinyclaw.intelligence import (
+    BootstrapLoader,
+    MemoryStore,
+    SkillsManager,
+    build_static_prefix,
+    build_system_prompt,
+)
 from tinyclaw.intelligence.reminder import ReminderStore
+from tinyclaw.notification import (
+    NotificationGateway,
+    NotificationPolicyConfig,
+    NotificationReason,
+    NotificationRequest,
+    SQLiteNotificationPolicy,
+)
+from tinyclaw.observability import (
+    FeedbackRecord,
+    FeedbackSource,
+    SQLiteFeedbackStore,
+    TraceRecorder,
+)
 from tinyclaw.resilience import AuthProfile, ProfileManager, ResilienceRunner
 from tinyclaw.scheduler import CronService, HeartbeatRunner
 from tinyclaw.session import SessionStore
@@ -60,7 +85,6 @@ from tinyclaw.utils.ansi import (
     print_warn,
 )
 from tinyclaw.utils.timezone import format_iso_to_beijing
-
 
 TURN_CONTEXT: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
     "turn_context",
@@ -131,10 +155,16 @@ def _set_reminder(
         content, due_str, _ = _parse_reminder_time(content)
         if due_str:
             due = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
-            return store.write_reminder(content, due, channel=channel, peer_id=peer_id, account_id=account_id)
-        return store.write_reminder(content, channel=channel, peer_id=peer_id, account_id=account_id)
+            return store.write_reminder(
+                content, due, channel=channel, peer_id=peer_id, account_id=account_id
+            )
+        return store.write_reminder(
+            content, channel=channel, peer_id=peer_id, account_id=account_id
+        )
 
-    return store.write_reminder(content, due, channel=channel, peer_id=peer_id, account_id=account_id)
+    return store.write_reminder(
+        content, due, channel=channel, peer_id=peer_id, account_id=account_id
+    )
 
 
 def _format_reminders(store: ReminderStore) -> str:
@@ -198,7 +228,11 @@ def _unwrap_wecom_cli_payload(raw_text: str) -> dict[str, Any]:
     content = data.get("content")
     if isinstance(content, list) and content:
         first = content[0]
-        if isinstance(first, dict) and first.get("type") == "text" and isinstance(first.get("text"), str):
+        if (
+            isinstance(first, dict)
+            and first.get("type") == "text"
+            and isinstance(first.get("text"), str)
+        ):
             try:
                 nested = json.loads(first["text"])
                 if isinstance(nested, dict):
@@ -228,8 +262,12 @@ def _wecom_cli_send_message(cli_bin: str, chat_type: int, chatid: str, content: 
         output = (result.stdout or "").strip() or (result.stderr or "").strip()
         payload = _unwrap_wecom_cli_payload(output)
         if result.returncode != 0:
-            return json.dumps({"ok": False, "error": output, "returncode": result.returncode}, ensure_ascii=False)
-        return json.dumps({"ok": int(payload.get("errcode", -1)) == 0, "result": payload}, ensure_ascii=False)
+            return json.dumps(
+                {"ok": False, "error": output, "returncode": result.returncode}, ensure_ascii=False
+            )
+        return json.dumps(
+            {"ok": int(payload.get("errcode", -1)) == 0, "result": payload}, ensure_ascii=False
+        )
     except Exception as exc:
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
@@ -258,6 +296,7 @@ def print_help() -> None:
     print_info("  /queue    -- 显示投递队列状态")
     print_info("  /lanes    -- 显示并发 Lane 状态")
     print_info("  /trigger  -- 立即触发心跳")
+    print_info("  /feedback <up|down|correction> [说明] -- 记录反馈")
     print_info("  提示: wecom-cli 发送格式为 JSON，如 chat_type/chatid/msgtype/text")
     print_info("  quit/exit -- 退出程序")
 
@@ -328,7 +367,9 @@ def run_app(
             "description": "保存重要事实到长期记忆。",
             "input_schema": {
                 "type": "object",
-                "properties": {"content": {"type": "string", "description": "要记住的事实或偏好。"}},
+                "properties": {
+                    "content": {"type": "string", "description": "要记住的事实或偏好。"}
+                },
                 "required": ["content"],
             },
         },
@@ -391,7 +432,10 @@ def run_app(
                             "description": "会话类型，1=单聊，2=群聊",
                             "enum": [1, 2],
                         },
-                        "chatid": {"type": "string", "description": "会话ID。单聊为userid，群聊为群ID"},
+                        "chatid": {
+                            "type": "string",
+                            "description": "会话ID。单聊为userid，群聊为群ID",
+                        },
                         "content": {"type": "string", "description": "发送文本内容，最大2048字节"},
                     },
                     "required": ["chat_type", "chatid", "content"],
@@ -415,9 +459,11 @@ def run_app(
     mgr = AgentManager(workspace / ".agents")
     mgr.register(AgentConfig(id="main", name="小 Luna", dm_scope="per-peer", model=model_id))
 
-    profile_manager = ProfileManager([
-        AuthProfile(name="primary", provider="anthropic", api_key=api_key),
-    ])
+    profile_manager = ProfileManager(
+        [
+            AuthProfile(name="primary", provider="anthropic", api_key=api_key),
+        ]
+    )
     resilience = ResilienceRunner(profile_manager=profile_manager, model_id=model_id)
 
     sessions_dir = workspace / ".sessions" / "agents" / "main" / "sessions"
@@ -433,7 +479,9 @@ def run_app(
 
     def save_session_map() -> None:
         session_map_path.parent.mkdir(parents=True, exist_ok=True)
-        session_map_path.write_text(json.dumps(session_key_map, ensure_ascii=False, indent=2), encoding="utf-8")
+        session_map_path.write_text(
+            json.dumps(session_key_map, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     def get_session_id(session_key: str) -> str:
         sid = session_key_map.get(session_key)
@@ -490,7 +538,9 @@ def run_app(
             for r in mem_results:
                 snippet = r.get("snippet", "")
                 source = r.get("chunk", {}).get("path", "")
-                date = source.split("/")[-1].replace(".jsonl", "").replace("_", "-") if source else ""
+                date = (
+                    source.split("/")[-1].replace(".jsonl", "").replace("_", "-") if source else ""
+                )
                 lines.append(f"- [{date}] {snippet}")
             mem_ctx = "\n".join(lines)
         else:
@@ -508,7 +558,7 @@ def run_app(
         # Wrap as content blocks so Anthropic can cache the static prefix
         system_blocks = [
             {"type": "text", "text": _static_prefix, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": system_prompt[len(_static_prefix):]},
+            {"type": "text", "text": system_prompt[len(_static_prefix) :]},
         ]
 
         messages = list(history)
@@ -554,7 +604,15 @@ def run_app(
         try:
             telegram_channel = TelegramChannel(tg_account, state_dir=workspace / ".state")
             ch_mgr.register(telegram_channel)
-            bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="telegram", priority=90))
+            bindings.add(
+                Binding(
+                    agent_id="main",
+                    tier=4,
+                    match_key="channel",
+                    match_value="telegram",
+                    priority=90,
+                )
+            )
         except Exception as exc:
             print_warn(f"Telegram 启动失败: {exc}")
 
@@ -573,7 +631,15 @@ def run_app(
         try:
             wecom_cli_channel = WeComCliChannel(wc_account)
             ch_mgr.register(wecom_cli_channel)
-            bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="wecomcli", priority=92))
+            bindings.add(
+                Binding(
+                    agent_id="main",
+                    tier=4,
+                    match_key="channel",
+                    match_value="wecomcli",
+                    priority=92,
+                )
+            )
             print_info("WeCom CLI 轮询触发模式已启用")
         except Exception as exc:
             print_warn(f"WeCom CLI 通道启动失败: {exc}")
@@ -581,7 +647,9 @@ def run_app(
     workwechat_channel: WorkWeChatChannel | None = None
     workwechat_long: WorkWeChatLongConnectionChannel | None = None
     workwechat_sender: Any = None
-    workwechat_mode = str(cfg.get("workwechat_mode", "off")).strip().lower() if server_mode else "off"
+    workwechat_mode = (
+        str(cfg.get("workwechat_mode", "off")).strip().lower() if server_mode else "off"
+    )
     if workwechat_mode not in ("long", "webhook", "off"):
         workwechat_mode = "off"
 
@@ -607,7 +675,15 @@ def run_app(
             workwechat_long.start()
             ch_mgr.register_async(workwechat_long)
             workwechat_sender = workwechat_long
-            bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="workwechat", priority=95))
+            bindings.add(
+                Binding(
+                    agent_id="main",
+                    tier=4,
+                    match_key="channel",
+                    match_value="workwechat",
+                    priority=95,
+                )
+            )
             print_info("Work WeChat 长连接模式已启用")
         except Exception as exc:
             print_warn(f"Work WeChat 长连接启动失败: {exc}")
@@ -626,7 +702,15 @@ def run_app(
             workwechat_channel = WorkWeChatChannel(ww_account)
             ch_mgr.register(workwechat_channel)
             workwechat_sender = workwechat_channel
-            bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="workwechat", priority=95))
+            bindings.add(
+                Binding(
+                    agent_id="main",
+                    tier=4,
+                    match_key="channel",
+                    match_value="workwechat",
+                    priority=95,
+                )
+            )
             print_info("Work WeChat Webhook 模式已启用")
         except Exception as exc:
             print_warn(f"Work WeChat Webhook 启动失败: {exc}")
@@ -658,7 +742,15 @@ def run_app(
                 dingtalk_long.start()
                 ch_mgr.register_async(dingtalk_long)
                 dingtalk_sender = dingtalk_long
-                bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="dingtalk", priority=94))
+                bindings.add(
+                    Binding(
+                        agent_id="main",
+                        tier=4,
+                        match_key="channel",
+                        match_value="dingtalk",
+                        priority=94,
+                    )
+                )
                 print_info("DingTalk 长连接模式已启用")
             except Exception as exc:
                 print_warn(f"DingTalk 长连接启动失败: {exc}")
@@ -681,7 +773,15 @@ def run_app(
                 dingtalk_channel = DingTalkChannel(dd_account)
                 ch_mgr.register(dingtalk_channel)
                 dingtalk_sender = dingtalk_channel
-                bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="dingtalk", priority=94))
+                bindings.add(
+                    Binding(
+                        agent_id="main",
+                        tier=4,
+                        match_key="channel",
+                        match_value="dingtalk",
+                        priority=94,
+                    )
+                )
                 print_info("DingTalk Webhook 模式已启用")
             except Exception as exc:
                 print_warn(f"DingTalk 通道启动失败: {exc}")
@@ -760,7 +860,11 @@ def run_app(
             except Exception as exc:
                 print_warn(f"Feishu Webhook 通道初始化失败: {exc}")
 
-        bindings.add(Binding(agent_id="main", tier=4, match_key="channel", match_value="feishu", priority=100))
+        bindings.add(
+            Binding(
+                agent_id="main", tier=4, match_key="channel", match_value="feishu", priority=100
+            )
+        )
 
     enabled_channels: list[str] = ["cli"]
     if telegram_channel:
@@ -776,35 +880,118 @@ def run_app(
 
     registered_tools = dispatcher.list_tools()
 
-    def deliver_fn(channel: str, to: str, text: str, meta: dict[str, Any] | None = None) -> None:
+    def deliver_via_channel(
+        sender: Any,
+        channel: str,
+        to: str,
+        text: str,
+        **kwargs: Any,
+    ) -> DeliveryReceipt:
+        result = sender.send_with_receipt(to, text, **kwargs)
+        if not result.accepted:
+            raise RuntimeError(f"{channel} send failed")
+        return DeliveryReceipt(
+            platform_message_id=result.platform_message_id,
+            confirmed=result.confirmed,
+        )
+
+    def deliver_fn(
+        channel: str,
+        to: str,
+        text: str,
+        meta: dict[str, Any] | None = None,
+    ) -> DeliveryReceipt:
         meta = meta or {}
         if channel in ("console", "cli"):
             print_assistant(text)
-            return
+            return DeliveryReceipt()
         if channel == "telegram" and telegram_channel:
-            if not telegram_channel.send(to, text):
-                raise RuntimeError("telegram send failed")
-            return
+            return deliver_via_channel(telegram_channel, channel, to, text)
         if channel == "wecomcli" and wecom_cli_channel:
-            if not wecom_cli_channel.send(to, text):
-                raise RuntimeError("wecomcli send failed")
-            return
+            return deliver_via_channel(wecom_cli_channel, channel, to, text)
         if channel == "feishu" and feishu_sender:
-            if not feishu_sender.send(to, text):
-                raise RuntimeError("feishu send failed")
-            return
+            return deliver_via_channel(feishu_sender, channel, to, text)
         if channel == "workwechat" and workwechat_sender:
-            if not workwechat_sender.send(to, text, reply_req_id=meta.get("reply_req_id", "")):
-                raise RuntimeError("workwechat send failed")
-            return
+            return deliver_via_channel(
+                workwechat_sender,
+                channel,
+                to,
+                text,
+                reply_req_id=meta.get("reply_req_id", ""),
+            )
         if channel == "dingtalk" and dingtalk_sender:
-            if not dingtalk_sender.send(to, text):
-                raise RuntimeError("dingtalk send failed")
-            return
-        print_warn(f"未知投递通道: {channel}")
+            return deliver_via_channel(dingtalk_sender, channel, to, text)
+        raise RuntimeError(f"unknown or unavailable delivery channel: {channel}")
 
-    delivery_queue = DeliveryQueue(workspace / "delivery-queue")
-    delivery_runner = DeliveryRunner(delivery_queue, deliver_fn)
+    delivery_store = SQLiteDeliveryStore(workspace / "delivery.db")
+    migration = LegacyDeliveryMigrator(
+        legacy_queue_dir=workspace / "delivery-queue",
+        store=delivery_store,
+    ).migrate()
+    if migration.pending_imported or migration.dead_letters_imported:
+        print_info(
+            "已迁移旧投递记录: "
+            f"{migration.pending_imported} pending, "
+            f"{migration.dead_letters_imported} dead-letter"
+        )
+    if migration.failed_imports:
+        print_warn(f"有 {migration.failed_imports} 条旧投递记录迁移失败，源文件已保留")
+    trace_recorder = TraceRecorder(workspace / "observability")
+    feedback_store = SQLiteFeedbackStore(workspace / "feedback.db")
+    delivery_queue = DurableDeliveryQueue(
+        delivery_store,
+        trace_recorder=trace_recorder,
+    )
+    notification_policy = SQLiteNotificationPolicy(
+        workspace / "notifications.db",
+        config=NotificationPolicyConfig(timezone_name="Asia/Shanghai"),
+    )
+    notification_gateway = NotificationGateway(
+        policy=notification_policy,
+        queue=delivery_queue,
+        trace_recorder=trace_recorder,
+    )
+
+    def notify_text(
+        channel: str,
+        peer_id: str,
+        text: str,
+        *,
+        topic: str,
+        dedupe_key: str | None = None,
+    ):
+        return notification_gateway.notify(
+            NotificationRequest(
+                session_id=f"{channel}:{peer_id}",
+                topic=topic,
+                channel=channel,
+                account_id=channel,
+                peer_id=peer_id,
+                text=text,
+                dedupe_key=dedupe_key,
+            )
+        )
+
+    def record_trace(
+        event_type: str,
+        *,
+        session_id: str,
+        payload: dict[str, Any],
+        task_id: str | None = None,
+    ) -> None:
+        try:
+            trace_recorder.record(
+                event_type=event_type,
+                producer="gateway",
+                producer_version="gateway-v1",
+                session_id=session_id,
+                task_id=task_id,
+                payload=payload,
+            )
+        except Exception:
+            pass
+
+    delivery_runner = DurableDeliveryRunner(delivery_queue, deliver_fn)
     delivery_runner.start()
 
     heartbeat_lock = threading.Lock()
@@ -850,17 +1037,38 @@ def run_app(
                     r_channel = str(r.get("channel", "")).strip()
                     r_peer = str(r.get("peer_id", "")).strip()
                     if server_mode and r_channel and r_peer:
-                        delivery_queue.enqueue(r_channel, r_peer, reminder_text)
-                    elif server_mode and feishu_sender and (feishu_fixed_reminder_to or last_active_feishu_peer):
+                        target_channel, target_peer = r_channel, r_peer
+                    elif (
+                        server_mode
+                        and feishu_sender
+                        and (feishu_fixed_reminder_to or last_active_feishu_peer)
+                    ):
+                        target_channel = "feishu"
                         target_peer = feishu_fixed_reminder_to or last_active_feishu_peer
-                        delivery_queue.enqueue("feishu", target_peer, reminder_text)
                     else:
-                        delivery_queue.enqueue("cli", "cli-user", reminder_text)
-                    reminder_store.mark_reminded(r.get("ts", ""))
+                        target_channel, target_peer = "cli", "cli-user"
+                    decision = notify_text(
+                        target_channel,
+                        target_peer,
+                        reminder_text,
+                        topic="reminder",
+                        dedupe_key=f"reminder:{r.get('ts', '')}",
+                    )
+                    if decision.allowed or decision.reason in {
+                        NotificationReason.UNSUBSCRIBED,
+                        NotificationReason.EXPIRED,
+                        NotificationReason.DUPLICATE,
+                    }:
+                        reminder_store.mark_reminded(r.get("ts", ""))
             except Exception:
                 pass
 
-    threading.Thread(target=reminder_check_loop, daemon=True, name="reminder-check").start()
+    reminder_thread = threading.Thread(
+        target=reminder_check_loop,
+        daemon=True,
+        name="reminder-check",
+    )
+    reminder_thread.start()
 
     def handle_inbound_message(msg: Any) -> None:
         nonlocal last_active_feishu_peer
@@ -908,6 +1116,18 @@ def run_app(
                     delivery_queue.enqueue("feishu", msg.peer_id, _build_feishu_intro())
 
         aid, sk = resolve_route(bindings, mgr, msg.channel, msg.peer_id, account_id=msg.account_id)
+        record_trace(
+            "inbound_routed",
+            session_id=sk,
+            payload={
+                "channel": msg.channel,
+                "account_id": msg.account_id,
+                "peer_id": msg.peer_id,
+                "agent_id": aid,
+                "text": msg.text,
+                "raw": raw,
+            },
+        )
         future = cmd_queue.enqueue(
             LANE_MAIN,
             lambda: run_turn(
@@ -923,17 +1143,36 @@ def run_app(
             reply = future.result(timeout=120)
             if reply:
                 for chunk in chunk_message(reply, msg.channel):
+                    delivery_meta = {
+                        "session_id": sk,
+                        "semantic_type": "result",
+                    }
+                    if msg.channel == "workwechat" and reply_req_id:
+                        delivery_meta["reply_req_id"] = reply_req_id
                     delivery_queue.enqueue(
                         msg.channel,
                         msg.peer_id,
                         chunk,
-                        meta={"reply_req_id": reply_req_id} if (msg.channel == "workwechat" and reply_req_id) else None,
+                        meta=delivery_meta,
                     )
             if msg.channel == "feishu":
                 save_feishu_state()
         except concurrent.futures.TimeoutError:
+            record_trace(
+                "task_timeout",
+                session_id=sk,
+                payload={"channel": msg.channel, "timeout_seconds": 120},
+            )
             print_warn("渠道消息处理超时")
         except Exception as exc:
+            record_trace(
+                "task_failed",
+                session_id=sk,
+                payload={
+                    "channel": msg.channel,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                },
+            )
             print_warn(f"渠道消息处理失败: {exc}")
 
     def telegram_poll_loop() -> None:
@@ -1041,7 +1280,9 @@ def run_app(
                     return
 
                 if "challenge" in payload:
-                    data = json.dumps({"challenge": payload["challenge"]}, ensure_ascii=False).encode("utf-8")
+                    data = json.dumps(
+                        {"challenge": payload["challenge"]}, ensure_ascii=False
+                    ).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(data)))
@@ -1064,7 +1305,9 @@ def run_app(
                 return
 
         webhook_server = ThreadingHTTPServer((webhook_host, webhook_port), FeishuWebhookHandler)
-        webhook_thread = threading.Thread(target=webhook_server.serve_forever, daemon=True, name="feishu-webhook")
+        webhook_thread = threading.Thread(
+            target=webhook_server.serve_forever, daemon=True, name="feishu-webhook"
+        )
         webhook_thread.start()
         print_info(f"Feishu Webhook 已启动: http://{webhook_host}:{webhook_port}{webhook_path}")
 
@@ -1113,7 +1356,9 @@ def run_app(
             name="workwechat-webhook",
         )
         workwechat_webhook_thread.start()
-        print_info(f"Work WeChat Webhook 已启动: http://{ww_webhook_host}:{ww_webhook_port}{ww_webhook_path}")
+        print_info(
+            f"Work WeChat Webhook 已启动: http://{ww_webhook_host}:{ww_webhook_port}{ww_webhook_path}"
+        )
 
     if server_mode and dingtalk_channel and dingtalk_mode == "webhook":
         dd_webhook_host = cfg.get("dingtalk_webhook_host", "0.0.0.0")
@@ -1160,7 +1405,9 @@ def run_app(
             name="dingtalk-webhook",
         )
         dingtalk_webhook_thread.start()
-        print_info(f"DingTalk Webhook 已启动: http://{dd_webhook_host}:{dd_webhook_port}{dd_webhook_path}")
+        print_info(
+            f"DingTalk Webhook 已启动: http://{dd_webhook_host}:{dd_webhook_port}{dd_webhook_path}"
+        )
 
     def inbound_worker() -> None:
         while not stop_event.is_set():
@@ -1185,7 +1432,9 @@ def run_app(
         print_info(f"  钉钉模式: {dingtalk_mode}")
         print_info("  运行中：多渠道服务 + Gateway + 后台任务")
     else:
-        print_info("  命令: /help, /status, /cron, /reminder, /memory, /queue, /lanes, /trigger")
+        print_info(
+            "  命令: /help, /status, /cron, /reminder, /memory, /queue, /lanes, /feedback, /trigger"
+        )
         print_info("  说明: 外部渠道轮询仅在 server 模式运行")
     print_info("=" * 60)
     print()
@@ -1194,16 +1443,36 @@ def run_app(
         if server_mode:
             while True:
                 for msg in heartbeat.drain_output():
-                    print_info(f"[心跳] {msg}")
+                    notify_text(
+                        "cli",
+                        "cli-user",
+                        f"[心跳] {msg}",
+                        topic="heartbeat",
+                    )
                 for msg in cron.drain_output():
-                    print_info(f"[定时任务] {msg}")
+                    notify_text(
+                        "cli",
+                        "cli-user",
+                        f"[定时任务] {msg}",
+                        topic="cron",
+                    )
                 time.sleep(1)
         else:
             while True:
                 for msg in heartbeat.drain_output():
-                    delivery_queue.enqueue("cli", "cli-user", f"[心跳] {msg}")
+                    notify_text(
+                        "cli",
+                        "cli-user",
+                        f"[心跳] {msg}",
+                        topic="heartbeat",
+                    )
                 for msg in cron.drain_output():
-                    delivery_queue.enqueue("cli", "cli-user", f"[定时任务] {msg}")
+                    notify_text(
+                        "cli",
+                        "cli-user",
+                        f"[定时任务] {msg}",
+                        topic="cron",
+                    )
 
                 try:
                     user_input = input(f"{CYAN}{BOLD}你 > {RESET}").strip()
@@ -1276,11 +1545,53 @@ def run_app(
                         print_info(f"  已完成: {qs.get('delivered', 0)}")
                     elif cmd == "/lanes":
                         for name, st in cmd_queue.stats().items():
-                            lane_name = {"main": "主队列", "cron": "定时任务", "heartbeat": "心跳"}.get(name, name)
+                            lane_name = {
+                                "main": "主队列",
+                                "cron": "定时任务",
+                                "heartbeat": "心跳",
+                            }.get(name, name)
                             print_info(
                                 f"  {lane_name}: 队列深度={st.get('queue_depth', 0)}, "
                                 f"活跃={st.get('active', 0)}, 最大并发={st.get('max_concurrency', 0)}"
                             )
+                    elif cmd == "/feedback":
+                        if len(parts) < 2:
+                            print_warn("用法: /feedback <up|down|correction> [说明]")
+                            continue
+                        feedback_parts = parts[1].split(maxsplit=1)
+                        feedback_kind = feedback_parts[0].lower()
+                        feedback_text = feedback_parts[1] if len(feedback_parts) > 1 else None
+                        feedback_sources = {
+                            "up": (FeedbackSource.UPVOTE, 1),
+                            "down": (FeedbackSource.DOWNVOTE, -1),
+                            "correction": (FeedbackSource.CORRECTION, -1),
+                        }
+                        selected = feedback_sources.get(feedback_kind)
+                        if selected is None:
+                            print_warn("反馈类型仅支持 up、down、correction")
+                            continue
+                        source, rating = selected
+                        feedback = FeedbackRecord(
+                            session_id="agent:main:direct:cli-user",
+                            source=source,
+                            rating=rating,
+                            text=feedback_text,
+                        )
+                        bad_case = feedback_store.add(feedback)
+                        record_trace(
+                            "user_feedback",
+                            session_id=feedback.session_id,
+                            payload={
+                                "feedback_id": feedback.feedback_id,
+                                "source": feedback.source.value,
+                                "rating": feedback.rating,
+                                "bad_case_category": (
+                                    bad_case.category.value if bad_case else None
+                                ),
+                            },
+                        )
+                        suffix = f"，Bad Case: {bad_case.category.value}" if bad_case else ""
+                        print_info(f"反馈已记录: {feedback.feedback_id}{suffix}")
                     elif cmd == "/trigger":
                         print_info(f"  {heartbeat.trigger()}")
                     else:
@@ -1288,15 +1599,36 @@ def run_app(
                     continue
 
                 sk = "agent:main:direct:cli-user"
+                record_trace(
+                    "inbound_routed",
+                    session_id=sk,
+                    payload={
+                        "channel": "cli",
+                        "account_id": "cli-local",
+                        "peer_id": "cli-user",
+                        "agent_id": "main",
+                        "text": user_input,
+                    },
+                )
                 future = cmd_queue.enqueue(
                     LANE_MAIN,
-                    lambda: run_turn(user_input, sk, "cli", "main", peer_id="cli-user", account_id="cli-local"),
+                    lambda: run_turn(
+                        user_input, sk, "cli", "main", peer_id="cli-user", account_id="cli-local"
+                    ),
                 )
                 try:
                     result = future.result(timeout=120)
                     if result:
                         for chunk in chunk_message(result, "cli"):
-                            delivery_queue.enqueue("cli", "cli-user", chunk)
+                            delivery_queue.enqueue(
+                                "cli",
+                                "cli-user",
+                                chunk,
+                                meta={
+                                    "session_id": sk,
+                                    "semantic_type": "result",
+                                },
+                            )
                 except concurrent.futures.TimeoutError:
                     print_warn("请求超时。")
                 except Exception as exc:
@@ -1309,9 +1641,14 @@ def run_app(
         stop_event.set()
         cron_stop.set()
         heartbeat.stop()
+        if reminder_thread.is_alive():
+            reminder_thread.join(timeout=2.0)
         ch_mgr.close_all()
         cmd_queue.wait_for_all(timeout=3.0)
-        delivery_runner.stop()
+        if delivery_runner.stop():
+            delivery_store.close()
+        notification_policy.close()
+        feedback_store.close()
 
         if webhook_server:
             webhook_server.shutdown()

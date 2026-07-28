@@ -6,12 +6,14 @@ import uuid
 from dataclasses import replace
 from typing import Any
 
+from tinyclaw.contracts import TraceContext
 from tinyclaw.contracts._common import require_text, utc_now
 from tinyclaw.contracts.interaction import InteractionEventType, TaskInstance, TaskState
 from tinyclaw.interaction.task_store import (
     SQLiteTaskStore,
     TaskRevisionConflictError,
 )
+from tinyclaw.observability import TraceRecorder
 
 
 class InvalidTaskTransitionError(ValueError):
@@ -32,9 +34,7 @@ ALLOWED_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
             TaskState.RECOVERY_REQUIRED,
         }
     ),
-    TaskState.WAITING_USER: frozenset(
-        {TaskState.RUNNING, TaskState.CANCELLED, TaskState.EXPIRED}
-    ),
+    TaskState.WAITING_USER: frozenset({TaskState.RUNNING, TaskState.CANCELLED, TaskState.EXPIRED}),
     TaskState.WAITING_CONFIRMATION: frozenset(
         {TaskState.RUNNING, TaskState.CANCELLED, TaskState.EXPIRED}
     ),
@@ -70,8 +70,14 @@ _MUTABLE_FIELDS = frozenset(
 
 
 class TaskStateMachine:
-    def __init__(self, store: SQLiteTaskStore) -> None:
+    def __init__(
+        self,
+        store: SQLiteTaskStore,
+        *,
+        trace_recorder: TraceRecorder | None = None,
+    ) -> None:
         self.store = store
+        self.trace_recorder = trace_recorder
 
     def create_task(
         self,
@@ -91,6 +97,13 @@ class TaskStateMachine:
             runtime_ref=runtime_ref,
         )
         self.store.create_task(task, actor=actor, trace_id=trace_id)
+        self._trace(
+            task,
+            event_type="task_created",
+            actor=actor,
+            trace_id=trace_id,
+            payload={"state": task.state.value, "revision": task.revision},
+        )
         return task
 
     def transition(
@@ -114,8 +127,7 @@ class TaskStateMachine:
         current = self.store.get_task(task_id)
         if expected_revision is not None and current.revision != expected_revision:
             raise TaskRevisionConflictError(
-                f"task {task_id!r} expected revision {expected_revision}, "
-                f"found {current.revision}"
+                f"task {task_id!r} expected revision {expected_revision}, found {current.revision}"
             )
         if target_state not in ALLOWED_TRANSITIONS[current.state]:
             raise InvalidTaskTransitionError(
@@ -140,6 +152,18 @@ class TaskStateMachine:
             actor=actor,
             reason=reason,
             trace_id=trace_id,
+        )
+        self._trace(
+            updated,
+            event_type="task_state_changed",
+            actor=actor,
+            trace_id=trace_id,
+            payload={
+                "from_state": current.state.value,
+                "to_state": updated.state.value,
+                "reason": reason,
+                "revision": updated.revision,
+            },
         )
         return updated
 
@@ -168,8 +192,7 @@ class TaskStateMachine:
         current = self.store.get_task(task_id)
         if expected_revision is not None and current.revision != expected_revision:
             raise TaskRevisionConflictError(
-                f"task {task_id!r} expected revision {expected_revision}, "
-                f"found {current.revision}"
+                f"task {task_id!r} expected revision {expected_revision}, found {current.revision}"
             )
         updated = replace(
             current,
@@ -194,7 +217,46 @@ class TaskStateMachine:
                 "changed_fields": sorted(changes),
             },
         )
+        self._trace(
+            updated,
+            event_type="task_revised",
+            actor=actor,
+            trace_id=trace_id,
+            payload={
+                "state": updated.state.value,
+                "reason": reason,
+                "revision": updated.revision,
+                "changed_fields": sorted(changes),
+            },
+        )
         return updated
+
+    def _trace(
+        self,
+        task: TaskInstance,
+        *,
+        event_type: str,
+        actor: str,
+        trace_id: str | None,
+        payload: dict[str, object],
+    ) -> None:
+        if self.trace_recorder is None:
+            return
+        context = (
+            TraceContext(trace_id=trace_id, span_id=uuid.uuid4().hex[:16]) if trace_id else None
+        )
+        try:
+            self.trace_recorder.record(
+                event_type=event_type,
+                producer="task-state-machine",
+                producer_version="interaction-v1",
+                session_id=task.session_id,
+                task_id=task.task_id,
+                trace_context=context,
+                payload={"actor": actor, **payload},
+            )
+        except Exception:
+            pass
 
     def recover_interrupted(
         self,
@@ -203,9 +265,7 @@ class TaskStateMachine:
         trace_id: str | None = None,
     ) -> list[TaskInstance]:
         """Move non-resumable in-process states into explicit recovery."""
-        interrupted = self.store.list_tasks(
-            states=(TaskState.RUNNING, TaskState.WAITING_TOOL)
-        )
+        interrupted = self.store.list_tasks(states=(TaskState.RUNNING, TaskState.WAITING_TOOL))
         recovered: list[TaskInstance] = []
         for task in interrupted:
             try:

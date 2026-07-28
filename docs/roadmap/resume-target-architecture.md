@@ -253,12 +253,12 @@ Renderer 将 Intent 转成一个或多个 DeliveryRecord。
 - retry_count、next_retry_at
 - platform_message_id
 - last_error
-- created_at、acked_at
+- created_at、acked_at、accepted_at
 
 状态：
 
     PENDING → IN_FLIGHT → ACKED
-       │          │
+       │          ├── ACCEPTED_UNCONFIRMED
        │          ├── RETRY_WAIT → PENDING
        │          └── DEAD_LETTER
        └── CANCELLED/EXPIRED
@@ -421,6 +421,7 @@ Scheduler 只选择每个 lane 最小未终结 sequence：
 
 - Sender 成功返回 platform_message_id。
 - 事务内写 ACKED。
+- 若适配器只返回“已接受发送”而无平台 message_id，则写 ACCEPTED_UNCONFIRMED；该状态只表示适配器边界成功，语义仍为 At-Least-Once。
 - 如果发送成功但写 ACK 前崩溃：
   - 平台支持 idempotency：使用相同 key 重试。
   - 平台支持查询：按 key/message id 查询。
@@ -447,6 +448,9 @@ ChannelCapability：
 
 Renderer Registry 按 semantic_type 和 capability 选择 renderer。
 
+每次渲染必须同时保存平台无关 SemanticSnapshot 与稳定 hash；DeliveryRecord
+仅保存渠道化结果，不得覆盖原始语义快照。
+
 降级链示例：
 
     rich card → markdown → plain text
@@ -471,6 +475,9 @@ Policy 决策顺序：
 
 每次 suppressed 记录 reason 和 policy version。Heartbeat、Cron、Reminder 不能直接调用 DeliveryQueue。
 
+允许通知先写 RESERVED；只有耐久投递入队成功后才提交 ALLOWED。入队失败写
+ENQUEUE_FAILED 并释放 dedupe reservation，避免通知永久丢失。
+
 ## 14. Trace 与 Artifact
 
 TraceRecorder 接收领域事件，按 session/task 分区 append-only 存储。建议：
@@ -480,6 +487,9 @@ TraceRecorder 接收领域事件，按 session/task 分区 append-only 存储。
     traces/<session>/<task>/timeline.md
 
 敏感字段经过 Redactor。Trace event 带 schema、producer 和 version。后处理标签另写 Annotation Revision。
+
+Recorder 写入失败必须与业务路径隔离；Task、Notification、Delivery 使用同一
+session/task 分区和单调 sequence。大 payload 先脱敏，再写内容寻址 Artifact。
 
 ## 15. Replay 架构
 
@@ -499,6 +509,9 @@ Runner 模式：
 - gateway-only：Stub Agent，验证路由、状态、投递。
 - agent-stub-tools：真实 Agent、录制工具。
 - live：真实 Agent/工具，用于人工实验。
+
+每次运行同时输出机器可读 JSON 与人工可读 Markdown Report；baseline 与
+candidate 按 evaluator score 生成 delta 和 regression 标记。
 
 Evaluator：
 

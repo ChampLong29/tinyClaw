@@ -226,7 +226,7 @@ DeliveryRecord 增加：
 - delivery_id、session_key、lane_key。
 - sequence。
 - idempotency_key。
-- state：pending、in_flight、acked、retry_wait、dead_letter。
+- state：pending、in_flight、acked、accepted_unconfirmed、retry_wait、dead_letter。
 - channel_message_id、attempts。
 - next_retry_at、lease_until。
 
@@ -237,7 +237,7 @@ DeliveryRecord 增加：
 3. max_concurrency=1 的 Lane 只发送队首。
 4. 队首 retry_wait 时后续默认不可越过。
 5. 发送前获取持久化 Lease，避免多 Worker 重复消费。
-6. 平台成功回执后原子写 ACK。
+6. 平台成功回执后原子写 ACK；仅适配器接受、未返回平台消息 ID 时写 accepted_unconfirmed，不得伪装成 ACK。
 7. 重启按 lane_key + sequence 重建。
 8. 超过阈值进入 Dead Letter，保留人工重放。
 
@@ -274,6 +274,7 @@ Renderer 接收 OutboundIntent，按 Capability 选择：
 - 降级文本。
 
 同一语义结果必须有平台无关 Snapshot，便于 Replay。
+Snapshot 需要稳定 hash，并随每个分段 DeliveryRecord 一并持久化。
 
 ### FR-11 主动通知治理
 
@@ -290,6 +291,7 @@ Renderer 接收 OutboundIntent，按 Capability 选择：
 - expiry。
 
 被抑制通知记录 reason，不进入 DeliveryQueue。高优先级绕过静默时段必须显式配置。
+允许通知先预留 dedupe/rate 配额，只有耐久入队成功后才提交；入队失败必须释放预留。
 
 ### FR-12 统一 Trace
 
@@ -307,6 +309,7 @@ interaction_trace.v1 关联：
 - user feedback。
 
 大内容写 Artifact，Trace 保存 hash/ref。Trace append-only，后处理标签使用 Revision。
+Trace/Artifact 写入失败不得阻断 Task、Notification 或 Delivery 主路径。
 
 ### FR-13 用户反馈与 Bad Case
 
@@ -335,6 +338,8 @@ Bad Case 分类至少包括：
 - notification_noise
 - poor_final_answer
 
+分类结果必须保存 confidence、reason 和关联 trace_event_ids，支持人工 Revision。
+
 ### FR-14 Replay 与回归评测
 
 ReplayCase 固化：
@@ -361,6 +366,9 @@ ReplayCase 固化：
 - Duplicate/out-of-order count。
 - User-visible latency。
 - Token/attempt cost。
+
+回归报告至少提供逐 evaluator PASS/FAIL、总分、baseline/candidate delta 和
+regression 标记，并可输出 JSON 与 Markdown。
 
 ## 5. 非功能需求
 

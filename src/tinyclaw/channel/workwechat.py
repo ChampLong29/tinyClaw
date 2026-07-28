@@ -14,7 +14,13 @@ import time
 import uuid
 from typing import Any
 
-from tinyclaw.channel.base import AsyncChannel, Channel, ChannelAccount, InboundMessage
+from tinyclaw.channel.base import (
+    AsyncChannel,
+    Channel,
+    ChannelAccount,
+    ChannelSendResult,
+    InboundMessage,
+)
 
 try:
     import httpx
@@ -83,9 +89,12 @@ class WorkWeChatChannel(Channel):
         return "user", to
 
     def send(self, to: str, text: str, **kwargs: Any) -> bool:
+        return self.send_with_receipt(to, text, **kwargs).accepted
+
+    def send_with_receipt(self, to: str, text: str, **kwargs: Any) -> ChannelSendResult:
         token = self._refresh_token()
         if not token:
-            return False
+            return ChannelSendResult(accepted=False)
 
         target_type, target_id = self._parse_target(to)
         try:
@@ -114,9 +123,18 @@ class WorkWeChatChannel(Channel):
                 )
 
             data = resp.json()
-            return int(data.get("errcode", -1)) == 0
+            if int(data.get("errcode", -1)) != 0:
+                return ChannelSendResult(accepted=False)
+            message_id = str(data.get("msgid", "") or data.get("msg_id", "")).strip()
+            if message_id:
+                return ChannelSendResult(
+                    accepted=True,
+                    platform_message_id=message_id,
+                    confirmed=True,
+                )
+            return ChannelSendResult(accepted=True)
         except Exception:
-            return False
+            return ChannelSendResult(accepted=False)
 
     def parse_event(self, payload: dict[str, Any], token: str = "") -> InboundMessage | None:
         """Parse normalized webhook payload into InboundMessage.
@@ -242,7 +260,12 @@ class WorkWeChatLongConnectionChannel(AsyncChannel):
         while self._running and not self._closed:
             now = time.time()
             if now - last_ping >= self.ping_interval_sec:
-                await ws.send(json.dumps({"cmd": "ping", "headers": {"req_id": self._new_req_id()}}, ensure_ascii=False))
+                await ws.send(
+                    json.dumps(
+                        {"cmd": "ping", "headers": {"req_id": self._new_req_id()}},
+                        ensure_ascii=False,
+                    )
+                )
                 last_ping = now
 
             await self._drain_send_queue(ws)
@@ -312,7 +335,9 @@ class WorkWeChatLongConnectionChannel(AsyncChannel):
             return None
 
         if cmd == "aibot_msg_callback":
-            msg_id = self._pick_str(body.get("msgid"), body.get("msg_id"), payload.get("msgid"), payload.get("msg_id"))
+            msg_id = self._pick_str(
+                body.get("msgid"), body.get("msg_id"), payload.get("msgid"), payload.get("msg_id")
+            )
             if msg_id:
                 if msg_id in self._seen_msg_ids:
                     return None
@@ -320,7 +345,9 @@ class WorkWeChatLongConnectionChannel(AsyncChannel):
                 if len(self._seen_msg_ids) > 10000:
                     self._seen_msg_ids.clear()
 
-            msg_type = self._pick_str(body.get("msgtype"), body.get("msg_type"), payload.get("msgtype"))
+            msg_type = self._pick_str(
+                body.get("msgtype"), body.get("msg_type"), payload.get("msgtype")
+            )
             if msg_type != "text":
                 return None
             text_node = body.get("text")
@@ -335,7 +362,12 @@ class WorkWeChatLongConnectionChannel(AsyncChannel):
             from_node = body.get("from")
             if not isinstance(from_node, dict):
                 from_node = {}
-            user_id = self._pick_str(from_node.get("userid"), from_node.get("user_id"), body.get("userid"), body.get("user_id"))
+            user_id = self._pick_str(
+                from_node.get("userid"),
+                from_node.get("user_id"),
+                body.get("userid"),
+                body.get("user_id"),
+            )
 
             chat_type = self._pick_str(body.get("chattype"), body.get("chat_type"), "single")
             chat_id = self._pick_str(body.get("chatid"), body.get("chat_id"))
@@ -359,13 +391,23 @@ class WorkWeChatLongConnectionChannel(AsyncChannel):
             event = body.get("event", {})
             if not isinstance(event, dict):
                 event = {}
-            event_type = self._pick_str(event.get("eventtype"), event.get("event_type"), body.get("eventtype"), body.get("event_type"))
+            event_type = self._pick_str(
+                event.get("eventtype"),
+                event.get("event_type"),
+                body.get("eventtype"),
+                body.get("event_type"),
+            )
             if event_type != "enter_chat":
                 return None
             from_node = body.get("from")
             if not isinstance(from_node, dict):
                 from_node = {}
-            user_id = self._pick_str(from_node.get("userid"), from_node.get("user_id"), body.get("userid"), body.get("user_id"))
+            user_id = self._pick_str(
+                from_node.get("userid"),
+                from_node.get("user_id"),
+                body.get("userid"),
+                body.get("user_id"),
+            )
             chat_type = self._pick_str(body.get("chattype"), body.get("chat_type"), "single")
             chat_id = self._pick_str(body.get("chatid"), body.get("chat_id"))
             if not user_id and not chat_id:

@@ -19,6 +19,7 @@ class InboundMessage:
     New gateway code should call :meth:`to_envelope` at the channel boundary.
     The DTO remains stable while adapters migrate to ``InboundEnvelope``.
     """
+
     text: str
     sender_id: str
     channel: str = ""
@@ -38,10 +39,28 @@ class InboundMessage:
 @dataclass
 class ChannelAccount:
     """Configuration for a bot account on a channel."""
+
     channel: str
     account_id: str
     token: str = ""
     config: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ChannelSendResult:
+    """Result at the channel boundary.
+
+    ``confirmed`` is true only when the platform returned a durable message ID.
+    A plain successful ``send`` call is merely adapter acceptance.
+    """
+
+    accepted: bool
+    platform_message_id: str | None = None
+    confirmed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.confirmed and not self.platform_message_id:
+            raise ValueError("confirmed channel send requires platform_message_id")
 
 
 class Channel(ABC):
@@ -58,6 +77,9 @@ class Channel(ABC):
     def send(self, to: str, text: str, **kwargs: Any) -> bool:
         """Send a text message to a recipient."""
         ...
+
+    def send_with_receipt(self, to: str, text: str, **kwargs: Any) -> ChannelSendResult:
+        return ChannelSendResult(accepted=self.send(to, text, **kwargs))
 
     def close(self) -> None:
         """Clean up resources. Override in subclasses."""
@@ -80,8 +102,10 @@ class AsyncChannel(ABC):
         ...
 
     @abstractmethod
-    def send(self, to: str, text: str, **kwargs: Any) -> bool:
-        ...
+    def send(self, to: str, text: str, **kwargs: Any) -> bool: ...
+
+    def send_with_receipt(self, to: str, text: str, **kwargs: Any) -> ChannelSendResult:
+        return ChannelSendResult(accepted=self.send(to, text, **kwargs))
 
     def close(self) -> None:
         pass
@@ -119,6 +143,7 @@ class ChannelManager:
         queues: dict[asyncio.Task, str] = {}
 
         for name, ch in self.async_channels.items():
+
             async def source(ch=ch):
                 async for msg in ch.receive_all():
                     return msg
@@ -130,7 +155,9 @@ class ChannelManager:
             queues[task] = name
 
         try:
-            done, pending = await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
             for t in pending:
                 t.cancel()
             for t in done:
@@ -141,4 +168,3 @@ class ChannelManager:
             for t in tasks:
                 t.cancel()
         return None
-

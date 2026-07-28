@@ -86,6 +86,7 @@ class SQLiteDeliveryStore:
                     last_error_json TEXT,
                     created_at TEXT NOT NULL,
                     acked_at TEXT,
+                    accepted_at TEXT,
                     schema_version TEXT NOT NULL,
                     UNIQUE(lane_key, sequence),
                     UNIQUE(target_channel, target_account_id, idempotency_key)
@@ -97,6 +98,11 @@ class SQLiteDeliveryStore:
                     ON deliveries(state, next_retry_at);
                 """
             )
+            columns = {
+                row["name"] for row in self._connection.execute("PRAGMA table_info(deliveries)")
+            }
+            if "accepted_at" not in columns:
+                self._connection.execute("ALTER TABLE deliveries ADD COLUMN accepted_at TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -339,6 +345,70 @@ class SQLiteDeliveryStore:
             )
         return self.get(delivery_id)
 
+    def mark_accepted_unconfirmed(
+        self,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        accepted_at: datetime | str | None = None,
+    ) -> DeliveryRecord:
+        require_text(worker_id, "worker_id")
+        current = parse_datetime(accepted_at, default_now=True)
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                UPDATE deliveries
+                SET state = ?, accepted_at = ?,
+                    lease_owner = NULL, lease_until = NULL, next_retry_at = NULL
+                WHERE delivery_id = ? AND state = ? AND lease_owner = ?
+                    AND lease_until > ?
+                """,
+                (
+                    DeliveryState.ACCEPTED_UNCONFIRMED.value,
+                    current.isoformat(),
+                    delivery_id,
+                    DeliveryState.IN_FLIGHT.value,
+                    worker_id,
+                    current.isoformat(),
+                ),
+            )
+        if cursor.rowcount != 1:
+            existing = self.get(delivery_id)
+            if existing.state == DeliveryState.ACCEPTED_UNCONFIRMED:
+                return existing
+            raise DeliveryLeaseConflictError(
+                f"worker {worker_id!r} does not own delivery {delivery_id!r}"
+            )
+        return self.get(delivery_id)
+
+    def import_dead_letter(
+        self,
+        delivery_id: str,
+        *,
+        error: Mapping[str, Any],
+    ) -> DeliveryRecord:
+        """Mark a newly imported pending record as a legacy dead letter."""
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                UPDATE deliveries
+                SET state = ?, last_error_json = ?
+                WHERE delivery_id = ? AND state = ?
+                """,
+                (
+                    DeliveryState.DEAD_LETTER.value,
+                    self._canonical_json(error),
+                    delivery_id,
+                    DeliveryState.PENDING.value,
+                ),
+            )
+        if cursor.rowcount == 1:
+            return self.get(delivery_id)
+        existing = self.get(delivery_id)
+        if existing.state == DeliveryState.DEAD_LETTER:
+            return existing
+        raise DeliveryStoreError(f"delivery {delivery_id!r} is not pending")
+
     def record_failure(
         self,
         delivery_id: str,
@@ -510,5 +580,6 @@ class SQLiteDeliveryStore:
             last_error=json.loads(row["last_error_json"]) if row["last_error_json"] else None,
             created_at=parse_datetime(row["created_at"], default_now=True),
             acked_at=parse_datetime(row["acked_at"]),
+            accepted_at=parse_datetime(row["accepted_at"]),
             schema_version=row["schema_version"],
         )

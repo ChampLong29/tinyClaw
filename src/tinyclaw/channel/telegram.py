@@ -6,11 +6,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from tinyclaw.channel.base import Channel, InboundMessage, ChannelAccount
-from tinyclaw.utils.ansi import RED
+from tinyclaw.channel.base import Channel, ChannelAccount, ChannelSendResult, InboundMessage
 
 try:
     import httpx
+
     HAS_HTTPX = True
 except ImportError:
     HAS_HTTPX = False
@@ -66,8 +66,9 @@ class TelegramChannel(Channel):
         self._api("sendChatAction", chat_id=chat_id, action="typing")
 
     def poll(self) -> list[InboundMessage]:
-        result = self._api("getUpdates", offset=self._offset, timeout=30,
-                           allowed_updates=["message"])
+        result = self._api(
+            "getUpdates", offset=self._offset, timeout=30, allowed_updates=["message"]
+        )
         if not result or not isinstance(result, list):
             return self._flush_all()
 
@@ -121,8 +122,11 @@ class TelegramChannel(Channel):
                 for mt in ("photo", "video", "document", "audio"):
                     if mt in m:
                         raw_m = m[mt]
-                        fid = (raw_m[-1]["file_id"] if isinstance(raw_m, list) and raw_m
-                               else (raw_m.get("file_id", "") if isinstance(raw_m, dict) else ""))
+                        fid = (
+                            raw_m[-1]["file_id"]
+                            if isinstance(raw_m, list) and raw_m
+                            else (raw_m.get("file_id", "") if isinstance(raw_m, dict) else "")
+                        )
                         media_items.append({"type": mt, "file_id": fid})
             inbound = self._parse(entries[0][0], entries[0][1])
             if inbound:
@@ -172,9 +176,13 @@ class TelegramChannel(Channel):
             peer_id = chat_id
 
         return InboundMessage(
-            text=text, sender_id=user_id, channel="telegram",
-            account_id=self.account_id, peer_id=peer_id,
-            is_group=is_group, raw=raw_update,
+            text=text,
+            sender_id=user_id,
+            channel="telegram",
+            account_id=self.account_id,
+            peer_id=peer_id,
+            is_group=is_group,
+            raw=raw_update,
         )
 
     def receive(self) -> InboundMessage | None:
@@ -182,15 +190,33 @@ class TelegramChannel(Channel):
         return msgs[0] if msgs else None
 
     def send(self, to: str, text: str, **kwargs) -> bool:
+        return self.send_with_receipt(to, text, **kwargs).accepted
+
+    def send_with_receipt(self, to: str, text: str, **kwargs) -> ChannelSendResult:
         chat_id, thread_id = to, None
         if ":topic:" in to:
             parts = to.split(":topic:")
             chat_id, thread_id = parts[0], int(parts[1]) if len(parts) > 1 else None
+        message_ids: list[str] = []
         for chunk in self._chunk(text):
-            if not self._api("sendMessage", chat_id=chat_id, text=chunk,
-                             message_thread_id=thread_id):
-                return False
-        return True
+            result = self._api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=chunk,
+                message_thread_id=thread_id,
+            )
+            if not result:
+                return ChannelSendResult(accepted=False)
+            message_id = result.get("message_id")
+            if message_id is not None:
+                message_ids.append(str(message_id))
+        if len(message_ids) == len(self._chunk(text)):
+            return ChannelSendResult(
+                accepted=True,
+                platform_message_id=",".join(message_ids),
+                confirmed=True,
+            )
+        return ChannelSendResult(accepted=True)
 
     def _chunk(self, text: str) -> list[str]:
         if len(text) <= self.MAX_MSG_LEN:

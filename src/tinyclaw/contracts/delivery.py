@@ -15,6 +15,7 @@ class DeliveryState(str, Enum):
     PENDING = "pending"
     IN_FLIGHT = "in_flight"
     ACKED = "acked"
+    ACCEPTED_UNCONFIRMED = "accepted_unconfirmed"
     RETRY_WAIT = "retry_wait"
     DEAD_LETTER = "dead_letter"
     CANCELLED = "cancelled"
@@ -57,6 +58,7 @@ class DeliveryRecord:
     last_error: Mapping[str, Any] | None = None
     created_at: datetime = field(default_factory=utc_now)
     acked_at: datetime | None = None
+    accepted_at: datetime | None = None
     schema_version: str = DELIVERY_RECORD_V1
 
     def __post_init__(self) -> None:
@@ -80,10 +82,13 @@ class DeliveryRecord:
             raise ValueError("in_flight delivery requires lease_owner and lease_until")
         if self.state == DeliveryState.ACKED and self.acked_at is None:
             raise ValueError("acked delivery requires acked_at")
+        if self.state == DeliveryState.ACCEPTED_UNCONFIRMED and self.accepted_at is None:
+            raise ValueError("accepted_unconfirmed delivery requires accepted_at")
         object.__setattr__(self, "lease_until", parse_datetime(self.lease_until))
         object.__setattr__(self, "next_retry_at", parse_datetime(self.next_retry_at))
         object.__setattr__(self, "created_at", parse_datetime(self.created_at, default_now=True))
         object.__setattr__(self, "acked_at", parse_datetime(self.acked_at))
+        object.__setattr__(self, "accepted_at", parse_datetime(self.accepted_at))
 
     def to_dict(self) -> dict[str, Any]:
         return to_primitive(self)
