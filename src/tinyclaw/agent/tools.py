@@ -9,6 +9,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
+from tinyclaw.pause_signals import InteractionPauseSignal
+
 # ---------------------------------------------------------------------------
 # Safety utilities
 # ---------------------------------------------------------------------------
@@ -37,6 +39,7 @@ def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
 # Built-in tool implementations
 # ---------------------------------------------------------------------------
 
+
 def tool_bash(command: str, timeout: int = 30, workdir: Path | None = None) -> str:
     """Execute a shell command and return its output."""
     dangerous = ["rm -rf /", "mkfs", "> /dev/sd", "dd if="]
@@ -45,8 +48,12 @@ def tool_bash(command: str, timeout: int = 30, workdir: Path | None = None) -> s
             return f"Error: Refused to run dangerous command containing '{pattern}'"
     try:
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=timeout, cwd=str(workdir or Path.cwd()),
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(workdir or Path.cwd()),
         )
         output = ""
         if result.stdout:
@@ -91,7 +98,9 @@ def tool_write_file(file_path: str, content: str, workdir: Path | None = None) -
         return f"Error: {exc}"
 
 
-def tool_edit_file(file_path: str, old_string: str, new_string: str, workdir: Path | None = None) -> str:
+def tool_edit_file(
+    file_path: str, old_string: str, new_string: str, workdir: Path | None = None
+) -> str:
     """Replace exact text in a file. old_string must appear exactly once."""
     try:
         target = safe_path(file_path, workdir)
@@ -149,7 +158,10 @@ BUILTIN_TOOLS: list[dict[str, Any]] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string", "description": "Path to the file (relative to working directory)."},
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file (relative to working directory).",
+                },
             },
             "required": ["file_path"],
         },
@@ -179,7 +191,10 @@ BUILTIN_TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Path to the file."},
-                "old_string": {"type": "string", "description": "The exact text to find and replace."},
+                "old_string": {
+                    "type": "string",
+                    "description": "The exact text to find and replace.",
+                },
                 "new_string": {"type": "string", "description": "The replacement text."},
             },
             "required": ["file_path", "old_string", "new_string"],
@@ -252,10 +267,25 @@ class ToolDispatcher:
             return f"Error: Unknown tool '{tool_name}'"
         try:
             return handler(**tool_input)
+        except InteractionPauseSignal:
+            raise
         except TypeError as exc:
             return f"Error: Invalid arguments for {tool_name}: {exc}"
         except Exception as exc:
             return f"Error: {tool_name} failed: {exc}"
+
+    def dispatch_strict(self, tool_name: str, tool_input: dict) -> str:
+        """Dispatch while preserving failures for the production recovery policy."""
+        handler = self._handlers.get(tool_name)
+        if handler is None:
+            raise RuntimeError(f"tool unavailable: {tool_name}")
+        try:
+            result = handler(**tool_input)
+        except TypeError as exc:
+            raise ValueError(f"invalid arguments for {tool_name}: {exc}") from exc
+        if result.startswith("Error:"):
+            raise RuntimeError(result.removeprefix("Error:").strip())
+        return result
 
     @property
     def tools(self) -> list[dict[str, Any]]:

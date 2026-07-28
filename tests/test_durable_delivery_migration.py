@@ -1,8 +1,16 @@
 from pathlib import Path
 
-from tinyclaw.contracts import DeliveryState
+from tinyclaw.contracts import (
+    ContentBlock,
+    ContentBlockType,
+    DeliveryState,
+    OutboundIntent,
+    OutboundTarget,
+    SemanticType,
+)
 from tinyclaw.delivery.durable import (
     DurableDeliveryQueue,
+    DurableDeliveryRunner,
     LegacyDeliveryMigrator,
 )
 from tinyclaw.delivery.queue import DeliveryQueue
@@ -76,6 +84,56 @@ def test_unconfirmed_adapter_acceptance_is_not_platform_ack(tmp_path: Path):
         assert result.acked_at is None
         assert result.platform_message_id is None
         assert store.get(delivery_id).state == DeliveryState.ACCEPTED_UNCONFIRMED
+    finally:
+        store.close()
+
+
+def test_render_metadata_reaches_sender_boundary(tmp_path: Path):
+    store = SQLiteDeliveryStore(tmp_path / "delivery.db")
+    renderer = OutboundRenderer(
+        CapabilityRegistry({"native": ChannelCapability(card=True, buttons=True, text_limit=1000)})
+    )
+    queue = DurableDeliveryQueue(store, renderer=renderer)
+    intent = OutboundIntent(
+        intent_id="intent-card",
+        session_id="session-1",
+        semantic_type=SemanticType.CONFIRMATION,
+        target=OutboundTarget(
+            channel="native",
+            account_id="account-1",
+            peer_id="peer-1",
+        ),
+        content_blocks=(
+            ContentBlock(
+                type=ContentBlockType.CARD,
+                text="确认发布",
+                metadata={"title": "发布"},
+            ),
+            ContentBlock(
+                type=ContentBlockType.ACTIONS,
+                metadata={"actions": [{"label": "确认", "action": "approve"}]},
+            ),
+        ),
+    )
+    captured = []
+
+    def deliver(channel, peer_id, text, meta):
+        captured.append((channel, peer_id, text, meta))
+        return DeliveryReceipt(platform_message_id="message-1", confirmed=True)
+
+    try:
+        queue.enqueue_intent(intent)
+        runner = DurableDeliveryRunner(queue, deliver)
+        runner.worker.run_once()
+
+        assert captured[0][0:2] == ("native", "peer-1")
+        render_metadata = captured[0][3]["render_metadata"]
+        assert render_metadata["native_payload"]["cards"][0]["metadata"]["title"] == "发布"
+        assert render_metadata["native_payload"]["actions"][0]["action"] == "approve"
+        assert captured[0][3]["delivery_id"]
+        assert captured[0][3]["idempotency_key"] == "intent:intent-card:0"
+        assert captured[0][3]["delivery_semantics"] == "at_least_once"
+        assert store.list_records()[0].state == DeliveryState.ACKED
     finally:
         store.close()
 

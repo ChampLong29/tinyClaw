@@ -13,7 +13,19 @@
 6. 用户可见进度不暴露思维链。
 7. 所有失败和人工纠正都可转为 Replay 资产。
 
-> 现状边界：当前 `CommandQueue` 仅使用全局 `main`、`cron`、`heartbeat` Lane，普通用户请求统一进入 `main`；现有 DeliveryQueue 是可恢复的原子文件队列，但本地删除并非平台 ACK。本设计中的会话级 Lane、Sequence、Lease、幂等键和 ACK 均属于目标态。
+> 实施进展：普通渠道、CLI 与 WebSocket 请求已先持久化为 Task，再进入由 Session Key
+> 派生的独立执行 Lane；同会话串行、不同会话可并行。生产入口已支持显式
+> `/task status/cancel/pause/modify/resume`、启动中断恢复，以及 SQLite Delivery 的
+> Sequence、Lease、幂等键和平台回执。持久化 IdentityResolver 默认按账号/渠道/会话
+> 隔离，并支持显式 Link、Unlink、Merge 及版本化 Session Policy。生产工具路径已接入
+> 持久化 Clarification/Confirmation：高风险动作在有效签名确认前不会分派，授权仅能被
+> 同一 Task/Session/Identity 对精确参数消费一次。Capability Renderer 已按真实 Sender
+> 能力选择 Card/Markdown/Text、进度 update/milestone 及附件/按钮降级，并将原生渲染元数据
+> 随 Durable Delivery 传到 Channel 边界。Delivery Worker 已提供 claim 后、send 后 settle 前、
+> settle 后三阶段确定性崩溃注入，覆盖 Lease 恢复、FIFO 和 ACK 丢失窗口；另提供默认不
+> 发送真实消息的 `python -m tinyclaw.delivery.acceptance` 部署演练命令与 JSON 报告。
+> 外部平台沙箱的真实网络、Auth 过期和 ACK 丢失演练仍需专用测试账号人工执行，步骤见
+> `docs/roadmap/delivery-sandbox-acceptance.md`。
 
 ## 2. 总体架构
 
@@ -362,6 +374,11 @@ RequestStore 保存 open request，并生成签名 action token。只有：
 
 Confirmation 记录 action digest；实际执行前重新计算 digest，参数变化则原确认失效。
 
+当前生产实现同时持久化规范化 action 与 scope。`/confirm approve|deny` 必须携带
+request_id 和签名 token；approve-once 在工具执行前原子转换为 consumed，进程重启后仍可
+验证，deny 直接取消任务。`/clarify` 只接受结构化 JSON 或 `field=value`，答复完成后通过
+原 Session Lane 恢复任务。普通聊天不会隐式回答或批准请求。
+
 ## 10. 工具恢复架构
 
 ToolOperation：
@@ -385,6 +402,13 @@ ToolOperation：
       fatal → failed
 
 禁止对有副作用且未知执行结果的操作盲目重试。
+
+当前生产 Dispatcher 使用 strict 模式把字符串错误恢复为结构化失败，再由
+ToolErrorClassifier/ToolRecoveryPolicy 决策。只读/幂等操作可按上限退避重试；每次尝试
+共享 operation_id、生成新 attempt_id 并写入 Trace。invalid_arguments 返回 Agent 修正，
+permission 进入 Confirmation，partial_side_effect/user_action_required 进入 waiting_user，
+fatal 直接失败且不会触发模型凭据轮换。认证轮换通过显式 callback 接入；没有安全凭据或
+操作副作用不明确时退回 waiting_user。
 
 ## 11. 持久化 FIFO Delivery
 
@@ -427,6 +451,11 @@ Scheduler 只选择每个 lane 最小未终结 sequence：
   - 平台支持查询：按 key/message id 查询。
   - 都不支持：At-Least-Once，并启用重复检测/用户提示。
 
+当前 Worker 的故障注入钩子覆盖 `after_claim`、`after_send_before_settle`、`after_settle`。
+DeliveryRecord 的同一 idempotency_key 会在 Lease 到期后原样传给新 Worker 和 Sender；声明
+`outbound_idempotency` 的 Sender 可据此去重，其他渠道的持久化元数据和 Trace 明确标记
+`at_least_once`。崩溃恢复仍只选择每个 Lane 最早未终结 Sequence。
+
 ### 11.4 Dead Letter
 
 保留 payload、Trace、attempts 和最后错误。支持 inspect、retry、cancel、export，不自动无限回队。
@@ -458,6 +487,12 @@ Renderer Registry 按 semantic_type 和 capability 选择 renderer。
     file → artifact link → summarized text
 
 Chunker 必须理解内容块边界，避免把代码块、链接或确认按钮语义切断。
+
+当前默认 Capability 采用保守真值：未实现原生上传/卡片的 Sender 不声明 file/image/card；
+Work WeChat 按 long/webhook 实际模式动态声明 markdown 与 delivery receipt。Renderer 支持
+Card、Actions、File/Image 的原生 payload 元数据，并依次降级到 markdown/plain text、
+artifact link；Progress 根据 `progress_update` 选择 update 或 milestone。渲染格式、降级原因
+和原生 payload 均持久化并传递至 Sender kwargs，SemanticSnapshot/hash 在所有分段保持一致。
 
 ## 13. 主动通知
 

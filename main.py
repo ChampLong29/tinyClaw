@@ -37,18 +37,19 @@ from tinyclaw.channel.feishu import FeishuChannel
 from tinyclaw.channel.telegram import TelegramChannel
 from tinyclaw.channel.wecom_cli import WeComCliChannel
 from tinyclaw.channel.workwechat import WorkWeChatChannel, WorkWeChatLongConnectionChannel
-from tinyclaw.concurrency import LANE_CRON, LANE_HEARTBEAT, LANE_MAIN, CommandQueue
+from tinyclaw.concurrency import LANE_CRON, LANE_HEARTBEAT, CommandQueue
+from tinyclaw.contracts.interaction import TaskInstance, TaskState
 from tinyclaw.delivery import (
     DeliveryReceipt,
     DurableDeliveryQueue,
     DurableDeliveryRunner,
     LegacyDeliveryMigrator,
     SQLiteDeliveryStore,
-    chunk_message,
 )
 from tinyclaw.gateway import AgentConfig, AgentManager, Binding, BindingTable, GatewayServer
 from tinyclaw.gateway.routing import resolve_route
 from tinyclaw.gateway.server import get_event_loop
+from tinyclaw.identity import IdentitySessionResolver, SessionPolicy, SQLiteIdentityStore
 from tinyclaw.intelligence import (
     BootstrapLoader,
     MemoryStore,
@@ -57,6 +58,27 @@ from tinyclaw.intelligence import (
     build_system_prompt,
 )
 from tinyclaw.intelligence.reminder import ReminderStore
+from tinyclaw.interaction import (
+    ActiveTaskExistsError,
+    ClarificationRequiredSignal,
+    ClarificationService,
+    ConfirmationService,
+    ConfirmationTokenSigner,
+    ProductionInteractionService,
+    SQLiteRequestStore,
+    SQLiteTaskStore,
+    TaskExecutionOutcome,
+    TaskStateMachine,
+    ToolExecutionContext,
+    ToolExecutionGate,
+    parse_clarification_command,
+    parse_confirmation_command,
+    parse_task_command,
+    session_lane_name,
+)
+from tinyclaw.interaction.confirmation import load_or_create_confirmation_secret
+from tinyclaw.interaction.control import ControlAction, ControlPrincipal
+from tinyclaw.interaction.request_store import ClarificationRequest, ConfirmationRequest
 from tinyclaw.notification import (
     NotificationGateway,
     NotificationPolicyConfig,
@@ -65,12 +87,15 @@ from tinyclaw.notification import (
     SQLiteNotificationPolicy,
 )
 from tinyclaw.observability import (
+    ArtifactStore,
     FeedbackRecord,
     FeedbackSource,
     SQLiteFeedbackStore,
     TraceRecorder,
 )
+from tinyclaw.presentation import CapabilityRegistry, ChannelCapability, OutboundRenderer
 from tinyclaw.resilience import AuthProfile, ProfileManager, ResilienceRunner
+from tinyclaw.runtime.tool_executor import ToolRecoveryExecutor
 from tinyclaw.scheduler import CronService, HeartbeatRunner
 from tinyclaw.session import SessionStore
 from tinyclaw.utils.ansi import (
@@ -297,8 +322,27 @@ def print_help() -> None:
     print_info("  /lanes    -- 显示并发 Lane 状态")
     print_info("  /trigger  -- 立即触发心跳")
     print_info("  /feedback <up|down|correction> [说明] -- 记录反馈")
+    print_info("  /task status [task_id]              -- 查看任务状态")
+    print_info("  /task cancel|pause|resume [task_id] -- 控制当前或指定任务")
+    print_info("  /task modify <task_id> <新目标>      -- 修改暂停中的任务")
+    print_info("  /confirm approve|deny <id> <token> -- 显式确认或拒绝高风险操作")
+    print_info("  /clarify <id> field=value          -- 回答任务澄清问题")
+    print_info("  /identity current                    -- 查看当前身份与会话边界")
+    print_info("  /identity link <global_id> <channel> <account> <user> -- 显式绑定")
+    print_info("  /identity unlink <channel> <account> <user>           -- 解除绑定")
+    print_info("  /identity merge <source_global_id> <target_global_id>  -- 合并身份")
     print_info("  提示: wecom-cli 发送格式为 JSON，如 chat_type/chatid/msgtype/text")
     print_info("  quit/exit -- 退出程序")
+
+
+def _format_task(task: TaskInstance) -> str:
+    detail = ""
+    if task.failure:
+        detail = f" | 失败: {task.failure.message}"
+    return (
+        f"任务 {task.task_id} | 状态: {task.state.value} | revision: {task.revision}"
+        f" | 目标: {task.user_goal}{detail}"
+    )
 
 
 def _build_feishu_intro() -> str:
@@ -360,6 +404,8 @@ def run_app(
     )
 
     dispatcher = ToolDispatcher()
+    tool_gate: ToolExecutionGate | None = None
+    tool_recovery_executor = ToolRecoveryExecutor()
     dispatcher.register_builtin(workdir=workspace)
     dispatcher.register(
         {
@@ -419,6 +465,32 @@ def run_app(
         },
         lambda **_: _format_reminders(reminder_store),
     )
+
+    def request_clarification(question: str, required_fields: list[str], **_: Any) -> str:
+        raise ClarificationRequiredSignal(
+            question=question,
+            required_fields=tuple(required_fields),
+        )
+
+    dispatcher.register(
+        {
+            "name": "request_clarification",
+            "description": "当执行任务缺少必须信息时，暂停任务并向用户提出结构化澄清问题。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "需要用户回答的问题。"},
+                    "required_fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "答复中必须提供的字段名。",
+                    },
+                },
+                "required": ["question", "required_fields"],
+            },
+        },
+        request_clarification,
+    )
     if cfg.get("wecom_cli_tool_enabled", cfg.get("wecom_cli_enabled", False)):
         dispatcher.register(
             {
@@ -450,14 +522,20 @@ def run_app(
         )
 
     cmd_queue = CommandQueue()
-    cmd_queue.get_or_create_lane(LANE_MAIN, max_concurrency=1)
     cmd_queue.get_or_create_lane(LANE_CRON, max_concurrency=1)
     cmd_queue.get_or_create_lane(LANE_HEARTBEAT, max_concurrency=1)
 
     bindings = BindingTable()
     bindings.add(Binding(agent_id="main", tier=5, match_key="default", match_value="*"))
     mgr = AgentManager(workspace / ".agents")
-    mgr.register(AgentConfig(id="main", name="小 Luna", dm_scope="per-peer", model=model_id))
+    mgr.register(
+        AgentConfig(
+            id="main",
+            name="小 Luna",
+            dm_scope=cfg["session_scope"],
+            model=model_id,
+        )
+    )
 
     profile_manager = ProfileManager(
         [
@@ -476,21 +554,27 @@ def run_app(
             session_key_map = {}
     else:
         session_key_map = {}
+    session_map_lock = threading.RLock()
 
     def save_session_map() -> None:
-        session_map_path.parent.mkdir(parents=True, exist_ok=True)
-        session_map_path.write_text(
-            json.dumps(session_key_map, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        with session_map_lock:
+            session_map_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = session_map_path.with_name(f".{session_map_path.name}.tmp")
+            temporary.write_text(
+                json.dumps(session_key_map, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(session_map_path)
 
     def get_session_id(session_key: str) -> str:
-        sid = session_key_map.get(session_key)
-        if sid:
+        with session_map_lock:
+            sid = session_key_map.get(session_key)
+            if sid:
+                return sid
+            sid = session_store.create_session(label=session_key)
+            session_key_map[session_key] = sid
+            save_session_map()
             return sid
-        sid = session_store.create_session(label=session_key)
-        session_key_map[session_key] = sid
-        save_session_map()
-        return sid
 
     # In-memory cache of latest messages[] per session.
     # Avoids re-reading the full JSONL from disk on every turn.
@@ -518,6 +602,8 @@ def run_app(
         agent_id: str = "main",
         peer_id: str = "",
         account_id: str = "",
+        task_id: str = "",
+        global_user_id: str = "",
     ) -> str:
         session_id = get_session_id(session_key)
 
@@ -567,11 +653,43 @@ def run_app(
 
         token = TURN_CONTEXT.set({"channel": channel, "peer_id": peer_id, "account_id": account_id})
         try:
+            tool_handler = dispatcher.dispatch
+            if tool_gate is not None and task_id and global_user_id:
+                execution_context = ToolExecutionContext(
+                    task_id=task_id,
+                    session_id=session_key,
+                    global_user_id=global_user_id,
+                )
+
+                def dispatch_with_gate(name: str, tool_input: dict[str, Any]) -> str:
+                    tool_gate.authorize(name, tool_input, execution_context)
+
+                    def emit_tool_event(event: dict[str, Any]) -> None:
+                        record_trace(
+                            str(event["event_type"]),
+                            session_id=session_key,
+                            task_id=task_id,
+                            payload=dict(event),
+                        )
+
+                    return tool_recovery_executor.execute(
+                        name,
+                        tool_input,
+                        dispatcher.dispatch_strict,
+                        scope={
+                            "task_id": task_id,
+                            "session_id": session_key,
+                            "global_user_id": global_user_id,
+                        },
+                        event_sink=emit_tool_event,
+                    )
+
+                tool_handler = dispatch_with_gate
             response, updated = resilience.run(
                 system=system_blocks,
                 messages=messages,
                 tools=dispatcher.tools,
-                tool_handler=dispatcher.dispatch,
+                tool_handler=tool_handler,
             )
         except Exception:
             # API call failed — the messages list may be in a dirty state.
@@ -902,15 +1020,22 @@ def run_app(
         meta: dict[str, Any] | None = None,
     ) -> DeliveryReceipt:
         meta = meta or {}
+        render_options = {
+            "format": meta.get("format", "text"),
+            "render_metadata": dict(meta.get("render_metadata") or {}),
+            "delivery_id": meta.get("delivery_id", ""),
+            "idempotency_key": meta.get("idempotency_key", ""),
+            "delivery_semantics": meta.get("delivery_semantics", "at_least_once"),
+        }
         if channel in ("console", "cli"):
             print_assistant(text)
             return DeliveryReceipt()
         if channel == "telegram" and telegram_channel:
-            return deliver_via_channel(telegram_channel, channel, to, text)
+            return deliver_via_channel(telegram_channel, channel, to, text, **render_options)
         if channel == "wecomcli" and wecom_cli_channel:
-            return deliver_via_channel(wecom_cli_channel, channel, to, text)
+            return deliver_via_channel(wecom_cli_channel, channel, to, text, **render_options)
         if channel == "feishu" and feishu_sender:
-            return deliver_via_channel(feishu_sender, channel, to, text)
+            return deliver_via_channel(feishu_sender, channel, to, text, **render_options)
         if channel == "workwechat" and workwechat_sender:
             return deliver_via_channel(
                 workwechat_sender,
@@ -918,9 +1043,10 @@ def run_app(
                 to,
                 text,
                 reply_req_id=meta.get("reply_req_id", ""),
+                **render_options,
             )
         if channel == "dingtalk" and dingtalk_sender:
-            return deliver_via_channel(dingtalk_sender, channel, to, text)
+            return deliver_via_channel(dingtalk_sender, channel, to, text, **render_options)
         raise RuntimeError(f"unknown or unavailable delivery channel: {channel}")
 
     delivery_store = SQLiteDeliveryStore(workspace / "delivery.db")
@@ -938,8 +1064,22 @@ def run_app(
         print_warn(f"有 {migration.failed_imports} 条旧投递记录迁移失败，源文件已保留")
     trace_recorder = TraceRecorder(workspace / "observability")
     feedback_store = SQLiteFeedbackStore(workspace / "feedback.db")
+    identity_store = SQLiteIdentityStore(workspace / "identity.db")
+    identity_session_resolver = IdentitySessionResolver(identity_store)
+    session_policy = SessionPolicy.from_values(
+        cfg["session_scope"],
+        cfg["session_scope_version"],
+    )
+    runtime_capabilities: dict[str, ChannelCapability] = {}
+    if workwechat_sender:
+        runtime_capabilities["workwechat"] = ChannelCapability(
+            text_limit=4000,
+            markdown=workwechat_mode == "long",
+            delivery_receipt=workwechat_mode == "webhook",
+        )
     delivery_queue = DurableDeliveryQueue(
         delivery_store,
+        renderer=OutboundRenderer(CapabilityRegistry(runtime_capabilities)),
         trace_recorder=trace_recorder,
     )
     notification_policy = SQLiteNotificationPolicy(
@@ -951,6 +1091,54 @@ def run_app(
         queue=delivery_queue,
         trace_recorder=trace_recorder,
     )
+    task_store = SQLiteTaskStore(workspace / "interaction.db")
+    task_state_machine = TaskStateMachine(task_store, trace_recorder=trace_recorder)
+    request_store = SQLiteRequestStore(workspace / "interaction.db")
+    clarification_service = ClarificationService(request_store, task_state_machine)
+    confirmation_service = ConfirmationService(
+        request_store,
+        task_state_machine,
+        ConfirmationTokenSigner(
+            load_or_create_confirmation_secret(
+                workspace,
+                cfg.get("confirmation_token_secret") or None,
+            )
+        ),
+    )
+    tool_gate = ToolExecutionGate(confirmation_service)
+    task_targets: dict[str, dict[str, str]] = {}
+    task_targets_lock = threading.RLock()
+
+    def emit_task_progress(event) -> None:
+        with task_targets_lock:
+            target = dict(task_targets.get(event.task_id, {}))
+        if not target or event.type.value == "completed":
+            return
+        try:
+            delivery_queue.enqueue(
+                target["channel"],
+                target["peer_id"],
+                f"[任务 {event.task_id[:8]}] {event.message}",
+                meta={
+                    "session_id": target["session_id"],
+                    "task_id": event.task_id,
+                    "semantic_type": "progress",
+                    "reply_req_id": target.get("reply_req_id", ""),
+                },
+            )
+        except Exception:
+            pass
+
+    interaction_service = ProductionInteractionService(
+        state_machine=task_state_machine,
+        artifact_store=ArtifactStore(workspace / "interaction-artifacts"),
+        progress_sink=emit_task_progress,
+        clarification_service=clarification_service,
+        confirmation_service=confirmation_service,
+    )
+    recovered_tasks = interaction_service.recover_interrupted()
+    if recovered_tasks:
+        print_warn(f"检测到 {len(recovered_tasks)} 个中断任务，已标记为 recovery_required")
 
     def notify_text(
         channel: str,
@@ -990,6 +1178,401 @@ def run_app(
             )
         except Exception:
             pass
+
+    def resolve_identity_context(
+        *,
+        agent_id: str,
+        channel: str,
+        account_id: str,
+        peer_id: str,
+        platform_user_id: str,
+        thread_id: str | None = None,
+    ):
+        resolution = identity_session_resolver.resolve(
+            agent_id=agent_id,
+            policy=session_policy,
+            channel=channel,
+            account_id=account_id or "default",
+            peer_id=peer_id,
+            platform_user_id=platform_user_id or peer_id,
+            thread_id=thread_id,
+        )
+        record_trace(
+            "identity_session_resolved",
+            session_id=resolution.session.session_id,
+            payload={
+                "agent_id": agent_id,
+                "channel": channel,
+                "account_id": account_id or "default",
+                "peer_id": peer_id,
+                "global_user_id": resolution.identity.global_user_id,
+                "scope_type": resolution.session.scope_type.value,
+                "scope_version": resolution.session.scope_version,
+                "route_key": resolution.session.route_key,
+                "decision_reason": resolution.session.decision_reason,
+                "identity_created": resolution.identity_created,
+                "session_created": resolution.session_created,
+            },
+        )
+        return resolution
+
+    def register_task_target(
+        task_id: str,
+        *,
+        session_id: str,
+        channel: str,
+        peer_id: str,
+        reply_req_id: str = "",
+    ) -> None:
+        with task_targets_lock:
+            task_targets[task_id] = {
+                "session_id": session_id,
+                "channel": channel,
+                "peer_id": peer_id,
+                "reply_req_id": reply_req_id,
+            }
+
+    def enqueue_task_text(
+        text: str,
+        *,
+        task_id: str,
+        session_id: str,
+        channel: str,
+        peer_id: str,
+        semantic_type: str,
+        reply_req_id: str = "",
+    ) -> None:
+        meta = {
+            "session_id": session_id,
+            "task_id": task_id,
+            "semantic_type": semantic_type,
+        }
+        if reply_req_id:
+            meta["reply_req_id"] = reply_req_id
+        delivery_queue.enqueue(channel, peer_id, text, meta=meta)
+
+    def format_clarification_prompt(request: ClarificationRequest) -> str:
+        fields = ", ".join(request.required_fields)
+        return (
+            f"[任务 {request.task_id[:8]}] 需要补充信息：{request.question}\n"
+            f"必填字段：{fields}\n"
+            f"请显式回复：/clarify {request.request_id} field=value"
+        )
+
+    def format_confirmation_prompt(request: ConfirmationRequest, token: str) -> str:
+        return (
+            f"[任务 {request.task_id[:8]}] 高风险操作待确认：{request.action_summary}\n"
+            f"批准一次：/confirm approve {request.request_id} {token}\n"
+            f"拒绝并终止任务：/confirm deny {request.request_id} {token}"
+        )
+
+    def emit_clarification_request(request_id: str) -> None:
+        request = request_store.get(request_id)
+        if not isinstance(request, ClarificationRequest):
+            return
+        with task_targets_lock:
+            target = dict(task_targets.get(request.task_id, {}))
+        if target:
+            enqueue_task_text(
+                format_clarification_prompt(request),
+                task_id=request.task_id,
+                session_id=request.session_id,
+                channel=target["channel"],
+                peer_id=target["peer_id"],
+                semantic_type="question",
+                reply_req_id=target.get("reply_req_id", ""),
+            )
+
+    def emit_confirmation_request(request_id: str, token: str) -> None:
+        request = request_store.get(request_id)
+        if not isinstance(request, ConfirmationRequest):
+            return
+        with task_targets_lock:
+            target = dict(task_targets.get(request.task_id, {}))
+        if target:
+            enqueue_task_text(
+                format_confirmation_prompt(request, token),
+                task_id=request.task_id,
+                session_id=request.session_id,
+                channel=target["channel"],
+                peer_id=target["peer_id"],
+                semantic_type="confirmation",
+                reply_req_id=target.get("reply_req_id", ""),
+            )
+
+    interaction_service.clarification_sink = emit_clarification_request
+    interaction_service.confirmation_sink = emit_confirmation_request
+
+    def run_persisted_task(
+        task_id: str,
+        *,
+        session_id: str,
+        global_user_id: str,
+        channel: str,
+        agent_id: str,
+        peer_id: str,
+        account_id: str,
+        resume: bool = False,
+        resume_input: str | None = None,
+    ) -> TaskExecutionOutcome:
+        return interaction_service.run(
+            task_id,
+            global_user_id=global_user_id,
+            executor=lambda context: run_turn(
+                (
+                    context.user_goal
+                    if resume_input is None
+                    else f"{context.user_goal}\n\n用户补充信息：{resume_input}"
+                ),
+                session_id,
+                channel,
+                agent_id,
+                peer_id=peer_id,
+                account_id=account_id,
+                task_id=context.task_id,
+                global_user_id=global_user_id,
+            ),
+            resume=resume,
+        )
+
+    def schedule_task_resume(
+        task: TaskInstance,
+        *,
+        session_id: str,
+        global_user_id: str,
+        channel: str,
+        account_id: str,
+        peer_id: str,
+        agent_id: str,
+        reply_req_id: str = "",
+        resume_input: str | None = None,
+    ) -> None:
+        register_task_target(
+            task.task_id,
+            session_id=session_id,
+            channel=channel,
+            peer_id=peer_id,
+            reply_req_id=reply_req_id,
+        )
+        target = {
+            "session_id": session_id,
+            "channel": channel,
+            "peer_id": peer_id,
+            "reply_req_id": reply_req_id,
+        }
+        future = cmd_queue.enqueue(
+            session_lane_name(session_id),
+            lambda: run_persisted_task(
+                task.task_id,
+                session_id=session_id,
+                global_user_id=global_user_id,
+                channel=channel,
+                agent_id=agent_id,
+                peer_id=peer_id,
+                account_id=account_id,
+                resume=True,
+                resume_input=resume_input,
+            ),
+        )
+        future.add_done_callback(
+            lambda completed: deliver_task_outcome(completed, fallback_target=target)
+        )
+
+    def deliver_task_outcome(future, *, fallback_target: dict[str, str]) -> None:
+        try:
+            outcome = future.result()
+        except Exception as exc:
+            print_warn(f"任务执行失败: {exc}")
+            return
+        with task_targets_lock:
+            target = dict(task_targets.get(outcome.task.task_id, fallback_target))
+            if outcome.task.state in {
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+                TaskState.CANCELLED,
+                TaskState.EXPIRED,
+            }:
+                task_targets.pop(outcome.task.task_id, None)
+        if outcome.task.state == TaskState.COMPLETED and outcome.text:
+            text = outcome.text
+            semantic_type = "result"
+        elif outcome.task.state == TaskState.FAILED:
+            message = outcome.task.failure.message if outcome.task.failure else "未知错误"
+            text = f"[任务 {outcome.task.task_id[:8]}] 执行失败: {message}"
+            semantic_type = "error"
+        elif outcome.task.state == TaskState.CANCELLED:
+            text = f"[任务 {outcome.task.task_id[:8]}] 已取消"
+            semantic_type = "progress"
+        else:
+            return
+        enqueue_task_text(
+            text,
+            task_id=outcome.task.task_id,
+            session_id=target["session_id"],
+            channel=target["channel"],
+            peer_id=target["peer_id"],
+            semantic_type=semantic_type,
+            reply_req_id=target.get("reply_req_id", ""),
+        )
+
+    def dispatch_task_command(
+        text: str,
+        *,
+        session_id: str,
+        channel: str,
+        account_id: str,
+        peer_id: str,
+        agent_id: str,
+        global_user_id: str,
+        reply_req_id: str = "",
+    ) -> bool:
+        parsed = parse_task_command(text)
+        if parsed is None:
+            return False
+        principal = ControlPrincipal(
+            session_id=session_id,
+            global_user_id=global_user_id,
+        )
+        if parsed.action == ControlAction.RESUME:
+            task = interaction_service.resolve_task(parsed, principal)
+            register_task_target(
+                task.task_id,
+                session_id=session_id,
+                channel=channel,
+                peer_id=peer_id,
+                reply_req_id=reply_req_id,
+            )
+            target = {
+                "session_id": session_id,
+                "channel": channel,
+                "peer_id": peer_id,
+                "reply_req_id": reply_req_id,
+            }
+
+            def resume_task() -> TaskExecutionOutcome:
+                interaction_service.control(parsed, principal)
+                return run_persisted_task(
+                    task.task_id,
+                    session_id=session_id,
+                    global_user_id=principal.global_user_id,
+                    channel=channel,
+                    agent_id=agent_id,
+                    peer_id=peer_id,
+                    account_id=account_id,
+                    resume=True,
+                )
+
+            future = cmd_queue.enqueue(
+                session_lane_name(session_id),
+                resume_task,
+            )
+            future.add_done_callback(
+                lambda completed: deliver_task_outcome(completed, fallback_target=target)
+            )
+            response = f"任务 {task.task_id} 的恢复请求已进入会话队列"
+        else:
+            task = interaction_service.control(parsed, principal)
+            response = _format_task(task)
+        enqueue_task_text(
+            response,
+            task_id=task.task_id,
+            session_id=session_id,
+            channel=channel,
+            peer_id=peer_id,
+            semantic_type="progress",
+            reply_req_id=reply_req_id,
+        )
+        return True
+
+    def dispatch_request_command(
+        text: str,
+        *,
+        session_id: str,
+        channel: str,
+        account_id: str,
+        peer_id: str,
+        agent_id: str,
+        global_user_id: str,
+        reply_req_id: str = "",
+    ) -> bool:
+        confirmation_command = parse_confirmation_command(text)
+        if confirmation_command is not None:
+            request = request_store.get(confirmation_command.request_id)
+            if not isinstance(request, ConfirmationRequest):
+                raise TypeError("request is not a confirmation")
+            resolved = confirmation_service.decide(
+                request.request_id,
+                session_id=session_id,
+                global_user_id=global_user_id,
+                action_token=confirmation_command.token,
+                decision=confirmation_command.decision,
+                actor=global_user_id,
+            )
+            task = task_store.get_task(request.task_id)
+            if resolved.state.value == "approved":
+                schedule_task_resume(
+                    task,
+                    session_id=session_id,
+                    global_user_id=global_user_id,
+                    channel=channel,
+                    account_id=account_id,
+                    peer_id=peer_id,
+                    agent_id=agent_id,
+                    reply_req_id=reply_req_id,
+                )
+                response = f"确认已通过；任务 {task.task_id} 已进入恢复队列"
+            else:
+                response = f"操作已拒绝；任务 {task.task_id} 已终止"
+            enqueue_task_text(
+                response,
+                task_id=task.task_id,
+                session_id=session_id,
+                channel=channel,
+                peer_id=peer_id,
+                semantic_type="progress",
+                reply_req_id=reply_req_id,
+            )
+            return True
+
+        clarification_command = parse_clarification_command(text)
+        if clarification_command is None:
+            return False
+        request = request_store.get(clarification_command.request_id)
+        if not isinstance(request, ClarificationRequest):
+            raise TypeError("request is not a clarification")
+        clarification_service.answer(
+            request.request_id,
+            session_id=session_id,
+            global_user_id=global_user_id,
+            answer=clarification_command.answer,
+            actor=global_user_id,
+        )
+        task = task_store.get_task(request.task_id)
+        schedule_task_resume(
+            task,
+            session_id=session_id,
+            global_user_id=global_user_id,
+            channel=channel,
+            account_id=account_id,
+            peer_id=peer_id,
+            agent_id=agent_id,
+            reply_req_id=reply_req_id,
+            resume_input=json.dumps(
+                clarification_command.answer,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        enqueue_task_text(
+            f"澄清答复已记录；任务 {task.task_id} 已进入恢复队列",
+            task_id=task.task_id,
+            session_id=session_id,
+            channel=channel,
+            peer_id=peer_id,
+            semantic_type="progress",
+            reply_req_id=reply_req_id,
+        )
+        return True
 
     delivery_runner = DurableDeliveryRunner(delivery_queue, deliver_fn)
     delivery_runner.start()
@@ -1115,7 +1698,22 @@ def run_app(
                 if feishu_sender:
                     delivery_queue.enqueue("feishu", msg.peer_id, _build_feishu_intro())
 
-        aid, sk = resolve_route(bindings, mgr, msg.channel, msg.peer_id, account_id=msg.account_id)
+        aid, legacy_sk = resolve_route(
+            bindings,
+            mgr,
+            msg.channel,
+            msg.peer_id,
+            account_id=msg.account_id,
+        )
+        identity_context = resolve_identity_context(
+            agent_id=aid,
+            channel=msg.channel,
+            account_id=msg.account_id,
+            peer_id=msg.peer_id,
+            platform_user_id=msg.sender_id or msg.peer_id,
+        )
+        sk = identity_context.session.session_id
+        global_user_id = identity_context.identity.global_user_id
         record_trace(
             "inbound_routed",
             session_id=sk,
@@ -1124,56 +1722,104 @@ def run_app(
                 "account_id": msg.account_id,
                 "peer_id": msg.peer_id,
                 "agent_id": aid,
+                "legacy_session_key": legacy_sk,
+                "global_user_id": global_user_id,
+                "session_scope": identity_context.session.scope_type.value,
+                "session_scope_version": identity_context.session.scope_version,
                 "text": msg.text,
                 "raw": raw,
             },
         )
-        future = cmd_queue.enqueue(
-            LANE_MAIN,
-            lambda: run_turn(
-                msg.text,
-                sk,
-                msg.channel,
-                aid,
-                peer_id=msg.peer_id,
-                account_id=msg.account_id,
-            ),
-        )
         try:
-            reply = future.result(timeout=120)
-            if reply:
-                for chunk in chunk_message(reply, msg.channel):
-                    delivery_meta = {
-                        "session_id": sk,
-                        "semantic_type": "result",
-                    }
-                    if msg.channel == "workwechat" and reply_req_id:
-                        delivery_meta["reply_req_id"] = reply_req_id
-                    delivery_queue.enqueue(
-                        msg.channel,
-                        msg.peer_id,
-                        chunk,
-                        meta=delivery_meta,
-                    )
+            if dispatch_request_command(
+                msg.text,
+                session_id=sk,
+                channel=msg.channel,
+                account_id=msg.account_id,
+                peer_id=msg.peer_id,
+                agent_id=aid,
+                global_user_id=global_user_id,
+                reply_req_id=reply_req_id,
+            ):
+                return
+            if dispatch_task_command(
+                msg.text,
+                session_id=sk,
+                channel=msg.channel,
+                account_id=msg.account_id,
+                peer_id=msg.peer_id,
+                agent_id=aid,
+                global_user_id=global_user_id,
+                reply_req_id=reply_req_id,
+            ):
+                return
+            task = interaction_service.submit(
+                session_id=sk,
+                global_user_id=global_user_id,
+                user_goal=msg.text,
+                runtime_ref=f"{aid}:{model_id}",
+                trace_id=raw.get("event_id") or None,
+            )
+            register_task_target(
+                task.task_id,
+                session_id=sk,
+                channel=msg.channel,
+                peer_id=msg.peer_id,
+                reply_req_id=reply_req_id,
+            )
+            target = {
+                "session_id": sk,
+                "channel": msg.channel,
+                "peer_id": msg.peer_id,
+                "reply_req_id": reply_req_id,
+            }
+            future = cmd_queue.enqueue(
+                session_lane_name(sk),
+                lambda: run_persisted_task(
+                    task.task_id,
+                    session_id=sk,
+                    global_user_id=global_user_id,
+                    channel=msg.channel,
+                    agent_id=aid,
+                    peer_id=msg.peer_id,
+                    account_id=msg.account_id,
+                ),
+            )
+            future.add_done_callback(
+                lambda completed: deliver_task_outcome(completed, fallback_target=target)
+            )
             if msg.channel == "feishu":
                 save_feishu_state()
-        except concurrent.futures.TimeoutError:
-            record_trace(
-                "task_timeout",
+        except ActiveTaskExistsError:
+            active = interaction_service.latest_task(sk)
+            active_id = active.task_id if active else "unknown"
+            enqueue_task_text(
+                f"当前会话已有活动任务 {active_id}，可使用 /task status 或 /task cancel。",
+                task_id=active_id,
                 session_id=sk,
-                payload={"channel": msg.channel, "timeout_seconds": 120},
+                channel=msg.channel,
+                peer_id=msg.peer_id,
+                semantic_type="progress",
+                reply_req_id=reply_req_id,
             )
-            print_warn("渠道消息处理超时")
         except Exception as exc:
             record_trace(
-                "task_failed",
+                "inbound_rejected",
                 session_id=sk,
                 payload={
                     "channel": msg.channel,
                     "error": {"type": type(exc).__name__, "message": str(exc)},
                 },
             )
-            print_warn(f"渠道消息处理失败: {exc}")
+            enqueue_task_text(
+                f"任务请求未受理: {exc}",
+                task_id="control",
+                session_id=sk,
+                channel=msg.channel,
+                peer_id=msg.peer_id,
+                semantic_type="error",
+                reply_req_id=reply_req_id,
+            )
 
     def telegram_poll_loop() -> None:
         if not telegram_channel:
@@ -1236,12 +1882,105 @@ def run_app(
                     inbound_queue.put(msg)
 
         async def run_agent_ws(_mgr: AgentManager, agent_id: str, sk: str, text: str) -> str:
-            return await asyncio.to_thread(run_turn, text, sk, "websocket", agent_id)
+            session = identity_store.get_session(sk)
+            if not session.global_user_id:
+                raise RuntimeError("resolved WebSocket session has no global identity")
+            global_user_id = session.global_user_id
+            resume = False
+            resume_input = None
+            confirmation_command = parse_confirmation_command(text)
+            clarification_command = parse_clarification_command(text)
+            if confirmation_command is not None:
+                request = request_store.get(confirmation_command.request_id)
+                if not isinstance(request, ConfirmationRequest):
+                    raise TypeError("request is not a confirmation")
+                resolved = confirmation_service.decide(
+                    request.request_id,
+                    session_id=sk,
+                    global_user_id=global_user_id,
+                    action_token=confirmation_command.token,
+                    decision=confirmation_command.decision,
+                    actor=global_user_id,
+                )
+                task = task_store.get_task(request.task_id)
+                if resolved.state.value != "approved":
+                    return f"操作已拒绝；任务 {task.task_id} 已终止"
+                resume = True
+            elif clarification_command is not None:
+                request = request_store.get(clarification_command.request_id)
+                if not isinstance(request, ClarificationRequest):
+                    raise TypeError("request is not a clarification")
+                clarification_service.answer(
+                    request.request_id,
+                    session_id=sk,
+                    global_user_id=global_user_id,
+                    answer=clarification_command.answer,
+                    actor=global_user_id,
+                )
+                task = task_store.get_task(request.task_id)
+                resume = True
+                resume_input = json.dumps(
+                    clarification_command.answer,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            else:
+                task = interaction_service.submit(
+                    session_id=sk,
+                    global_user_id=global_user_id,
+                    user_goal=text,
+                    runtime_ref=f"{agent_id}:{model_id}",
+                )
+            future = cmd_queue.enqueue(
+                session_lane_name(sk),
+                lambda: run_persisted_task(
+                    task.task_id,
+                    session_id=sk,
+                    global_user_id=global_user_id,
+                    channel="websocket",
+                    agent_id=agent_id,
+                    peer_id=session.peer_id,
+                    account_id="gateway",
+                    resume=resume,
+                    resume_input=resume_input,
+                ),
+            )
+            outcome = await asyncio.wrap_future(future)
+            if outcome.task.state == TaskState.COMPLETED:
+                return outcome.text or ""
+            if outcome.task.failure:
+                raise RuntimeError(outcome.task.failure.message)
+            if outcome.task.pending_request_ref:
+                pending = request_store.get(outcome.task.pending_request_ref)
+                if isinstance(pending, ConfirmationRequest):
+                    return format_confirmation_prompt(
+                        pending,
+                        confirmation_service.signer.issue(pending),
+                    )
+                if isinstance(pending, ClarificationRequest):
+                    return format_clarification_prompt(pending)
+            raise RuntimeError(f"task ended in state {outcome.task.state.value}")
+
+        def resolve_gateway_session(
+            agent_id: str,
+            channel: str,
+            account_id: str,
+            peer_id: str,
+            platform_user_id: str,
+        ) -> str:
+            return resolve_identity_context(
+                agent_id=agent_id,
+                channel=channel,
+                account_id=account_id,
+                peer_id=peer_id,
+                platform_user_id=platform_user_id,
+            ).session.session_id
 
         gateway = GatewayServer(
             mgr,
             bindings,
             run_agent_fn=run_agent_ws,
+            session_resolver_fn=resolve_gateway_session,
             host=gateway_host,
             port=gateway_port,
         )
@@ -1433,7 +2172,7 @@ def run_app(
         print_info("  运行中：多渠道服务 + Gateway + 后台任务")
     else:
         print_info(
-            "  命令: /help, /status, /cron, /reminder, /memory, /queue, /lanes, /feedback, /trigger"
+            "  命令: /help, /status, /cron, /reminder, /memory, /queue, /lanes, /task, /confirm, /clarify, /identity, /feedback, /trigger"
         )
         print_info("  说明: 外部渠道轮询仅在 server 模式运行")
     print_info("=" * 60)
@@ -1571,8 +2310,15 @@ def run_app(
                             print_warn("反馈类型仅支持 up、down、correction")
                             continue
                         source, rating = selected
+                        cli_identity = resolve_identity_context(
+                            agent_id="main",
+                            channel="cli",
+                            account_id="cli-local",
+                            peer_id="cli-user",
+                            platform_user_id="cli-user",
+                        )
                         feedback = FeedbackRecord(
-                            session_id="agent:main:direct:cli-user",
+                            session_id=cli_identity.session.session_id,
                             source=source,
                             rating=rating,
                             text=feedback_text,
@@ -1592,13 +2338,121 @@ def run_app(
                         )
                         suffix = f"，Bad Case: {bad_case.category.value}" if bad_case else ""
                         print_info(f"反馈已记录: {feedback.feedback_id}{suffix}")
+                    elif cmd in ("/confirm", "/clarify"):
+                        try:
+                            cli_identity = resolve_identity_context(
+                                agent_id="main",
+                                channel="cli",
+                                account_id="cli-local",
+                                peer_id="cli-user",
+                                platform_user_id="cli-user",
+                            )
+                            dispatch_request_command(
+                                user_input,
+                                session_id=cli_identity.session.session_id,
+                                channel="cli",
+                                account_id="cli-local",
+                                peer_id="cli-user",
+                                agent_id="main",
+                                global_user_id=cli_identity.identity.global_user_id,
+                            )
+                        except Exception as exc:
+                            print_warn(f"交互请求处理失败: {exc}")
+                    elif cmd == "/task":
+                        try:
+                            cli_identity = resolve_identity_context(
+                                agent_id="main",
+                                channel="cli",
+                                account_id="cli-local",
+                                peer_id="cli-user",
+                                platform_user_id="cli-user",
+                            )
+                            dispatch_task_command(
+                                user_input,
+                                session_id=cli_identity.session.session_id,
+                                channel="cli",
+                                account_id="cli-local",
+                                peer_id="cli-user",
+                                agent_id="main",
+                                global_user_id=cli_identity.identity.global_user_id,
+                            )
+                        except Exception as exc:
+                            print_warn(f"任务控制失败: {exc}")
+                    elif cmd == "/identity":
+                        identity_parts = user_input.split()
+                        action = identity_parts[1].lower() if len(identity_parts) > 1 else "current"
+                        try:
+                            if action == "current":
+                                cli_identity = resolve_identity_context(
+                                    agent_id="main",
+                                    channel="cli",
+                                    account_id="cli-local",
+                                    peer_id="cli-user",
+                                    platform_user_id="cli-user",
+                                )
+                                print_info(f"Global User: {cli_identity.identity.global_user_id}")
+                                print_info(
+                                    "Session: "
+                                    f"{cli_identity.session.session_id} "
+                                    f"({cli_identity.session.scope_type.value} "
+                                    f"v{cli_identity.session.scope_version})"
+                                )
+                                for link in cli_identity.identity.channel_links:
+                                    print_info(
+                                        "  Link: "
+                                        f"{link.channel}/{link.account_id}/{link.platform_user_id}"
+                                    )
+                            elif action == "link" and len(identity_parts) == 6:
+                                identity_session_resolver.identity.link_identity(
+                                    identity_parts[2],
+                                    channel=identity_parts[3],
+                                    account_id=identity_parts[4],
+                                    platform_user_id=identity_parts[5],
+                                    actor="cli-admin",
+                                    reason="explicit_cli_link",
+                                )
+                                print_info("身份绑定已创建；后续解析将使用目标 Global User")
+                            elif action == "unlink" and len(identity_parts) == 5:
+                                identity_store.unlink(
+                                    channel=identity_parts[2],
+                                    account_id=identity_parts[3],
+                                    platform_user_id=identity_parts[4],
+                                    actor="cli-admin",
+                                    reason="explicit_cli_unlink",
+                                )
+                                print_info("身份绑定已解除并写入审计记录")
+                            elif action == "merge" and len(identity_parts) == 4:
+                                identity_session_resolver.identity.merge_identities(
+                                    identity_parts[2],
+                                    identity_parts[3],
+                                    actor="cli-admin",
+                                    reason="explicit_cli_merge",
+                                )
+                                print_info("身份已合并；历史会话保持不变，后续解析使用目标身份")
+                            else:
+                                print_warn(
+                                    "用法: /identity current | "
+                                    "/identity link <global_id> <channel> <account> <user> | "
+                                    "/identity unlink <channel> <account> <user> | "
+                                    "/identity merge <source_global_id> <target_global_id>"
+                                )
+                        except Exception as exc:
+                            print_warn(f"身份操作失败: {exc}")
                     elif cmd == "/trigger":
                         print_info(f"  {heartbeat.trigger()}")
                     else:
                         print_warn(f"未知命令: {cmd}")
                     continue
 
-                sk = "agent:main:direct:cli-user"
+                cli_identity = resolve_identity_context(
+                    agent_id="main",
+                    channel="cli",
+                    account_id="cli-local",
+                    peer_id="cli-user",
+                    platform_user_id="cli-user",
+                )
+                sk = cli_identity.session.session_id
+                global_user_id = cli_identity.identity.global_user_id
                 record_trace(
                     "inbound_routed",
                     session_id=sk,
@@ -1607,30 +2461,56 @@ def run_app(
                         "account_id": "cli-local",
                         "peer_id": "cli-user",
                         "agent_id": "main",
+                        "global_user_id": global_user_id,
+                        "session_scope": cli_identity.session.scope_type.value,
+                        "session_scope_version": cli_identity.session.scope_version,
                         "text": user_input,
                     },
                 )
-                future = cmd_queue.enqueue(
-                    LANE_MAIN,
-                    lambda: run_turn(
-                        user_input, sk, "cli", "main", peer_id="cli-user", account_id="cli-local"
-                    ),
-                )
                 try:
-                    result = future.result(timeout=120)
-                    if result:
-                        for chunk in chunk_message(result, "cli"):
-                            delivery_queue.enqueue(
-                                "cli",
-                                "cli-user",
-                                chunk,
-                                meta={
-                                    "session_id": sk,
-                                    "semantic_type": "result",
-                                },
-                            )
+                    task = interaction_service.submit(
+                        session_id=sk,
+                        global_user_id=global_user_id,
+                        user_goal=user_input,
+                        runtime_ref=f"main:{model_id}",
+                    )
+                    register_task_target(
+                        task.task_id,
+                        session_id=sk,
+                        channel="cli",
+                        peer_id="cli-user",
+                    )
+                    target = {
+                        "session_id": sk,
+                        "channel": "cli",
+                        "peer_id": "cli-user",
+                        "reply_req_id": "",
+                    }
+                    future = cmd_queue.enqueue(
+                        session_lane_name(sk),
+                        lambda: run_persisted_task(
+                            task.task_id,
+                            session_id=sk,
+                            global_user_id=global_user_id,
+                            channel="cli",
+                            agent_id="main",
+                            peer_id="cli-user",
+                            account_id="cli-local",
+                        ),
+                    )
+                    future.result(timeout=120)
+                    deliver_task_outcome(future, fallback_target=target)
                 except concurrent.futures.TimeoutError:
-                    print_warn("请求超时。")
+                    future.add_done_callback(
+                        lambda completed: deliver_task_outcome(
+                            completed,
+                            fallback_target=target,
+                        )
+                    )
+                    print_warn(f"请求仍在运行，任务 ID: {task.task_id}")
+                except ActiveTaskExistsError:
+                    active = interaction_service.latest_task(sk)
+                    print_warn(f"当前会话已有活动任务: {active.task_id if active else 'unknown'}")
                 except Exception as exc:
                     print_warn(f"错误: {exc}")
 
@@ -1649,6 +2529,9 @@ def run_app(
             delivery_store.close()
         notification_policy.close()
         feedback_store.close()
+        request_store.close()
+        task_store.close()
+        identity_store.close()
 
         if webhook_server:
             webhook_server.shutdown()

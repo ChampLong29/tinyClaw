@@ -239,3 +239,78 @@ def test_trace_to_replay_to_report_and_regression_comparison(tmp_path: Path):
     assert candidate.passed is False
     assert comparison["regressed"] is True
     assert comparison["score_delta"] < 0
+
+
+def test_failed_trace_can_become_replay_case_and_report(tmp_path: Path):
+    trace = TraceRecorder(tmp_path / "trace")
+    trace.record(
+        event_type="inbound_received",
+        producer="gateway",
+        producer_version="gateway-v2",
+        session_id="session-failed",
+        task_id="task-failed",
+        payload={"text": "prepare report"},
+    )
+    failed_event = trace.record(
+        event_type="tool_failed",
+        producer="runtime",
+        producer_version="runtime-v3",
+        session_id="session-failed",
+        task_id="task-failed",
+        payload={
+            "tool": "report",
+            "error_type": "transient",
+            "message": "upstream timeout",
+        },
+    )
+    trace.record(
+        event_type="task_failed",
+        producer="interaction",
+        producer_version="interaction-v1",
+        session_id="session-failed",
+        task_id="task-failed",
+        payload={"reason": "tool retry budget exhausted"},
+    )
+    events = trace.read_events(
+        session_id="session-failed",
+        task_id="task-failed",
+    )
+    observation = ReplayObservation(
+        route={"agent_id": "main", "session_id": "session-failed"},
+        states=("queued", "running", "failed"),
+        task_completed=False,
+        tool_results=(
+            {
+                "tool": "report",
+                "status": "failed",
+                "error_type": "transient",
+            },
+        ),
+    )
+    case = ReplayCaseRecorder().capture(
+        case_id="failed-case",
+        inbound={
+            "schema_version": "inbound_envelope.v1",
+            "text": "prepare report",
+        },
+        trace_events=events,
+        observation=observation,
+        expected={
+            "required_states": ["queued", "running", "failed"],
+            "task_completed": False,
+        },
+        evaluators=("state", "completion"),
+    )
+
+    assert f"trace-event://{failed_event.trace_event_id}" in case.source_trace_refs
+    assert case.tool_recordings[failed_event.trace_event_id]["error_type"] == "transient"
+
+    report = ReplayRunner().run(case, mode=ReplayMode.AGENT_STUB_TOOLS)
+    json_report, markdown_report = ReplayRunner.write_report(
+        report,
+        tmp_path / "reports",
+    )
+
+    assert report.passed is True
+    assert json.loads(json_report.read_text(encoding="utf-8"))["case_id"] == "failed-case"
+    assert "PASS" in markdown_report.read_text(encoding="utf-8")

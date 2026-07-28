@@ -5,7 +5,7 @@
 
 ## 1. 背景与成功标准
 
-当前项目已有 Channel Adapter、InboundMessage、Binding 路由、Session Key、JSONL 会话、Prompt 分层、基于原子文件写入的持久化待投递队列、失败重试、内存 CommandQueue，以及 Heartbeat 和 Cron。当前用户请求统一进入全局 `main` Lane，而不是按会话创建 Lane；发送函数成功后删除本地队列文件也不等同于渠道平台 ACK。
+当前项目已有 Channel Adapter、InboundMessage、Binding 路由、持久化 Global Identity、版本化 Session Policy、JSONL 会话、Prompt 分层、持久化 Task State、会话级执行 Lane、SQLite Delivery、失败重试，以及 Heartbeat 和 Cron。普通渠道、CLI 与 WebSocket 请求已按 Session Key 串行、跨 Session 并行；平台返回消息 ID 时记录 ACK，只接受请求但没有消息 ID 时显式记录 `accepted_unconfirmed`。
 
 主要缺口：
 
@@ -420,6 +420,10 @@ regression 标记，并可输出 JSON 与 Markdown。
 
 完成 Progress、Control、Clarification、Confirmation、Tool Recovery。
 
+当前已完成生产 Clarification/Confirmation 闭环、高风险工具前置闸门，以及分类驱动的
+Tool Recovery 执行器；未知副作用不会盲目重试，每个 operation/attempt/decision 均进入
+持久化 Trace。
+
 ### M2 可靠投递
 
 完成持久化 Lane、Sequence、Lease、ACK、Idempotency 和 Dead Letter。
@@ -427,6 +431,9 @@ regression 标记，并可输出 JSON 与 Markdown。
 ### M3 渠道化 UX
 
 完成 Capability Renderer、进度更新、卡片/文件降级和 NotificationPolicy。
+
+当前 Capability Renderer、进度 update/milestone 选择、Card/按钮/附件原生元数据与降级链
+已接入 Durable Delivery；能力矩阵只声明实际 Sender 已实现的能力。
 
 ### M4 Trace/Replay
 
@@ -444,14 +451,25 @@ regression 标记，并可输出 JSON 与 Markdown。
 
 ## 8. 最终验收
 
-- [ ] 多账号、多用户和跨渠道 Session 边界测试通过。
-- [ ] Interaction State 非法转换被拒绝。
-- [ ] 长任务可进度反馈、取消、修改和恢复。
-- [ ] 高风险动作无确认不可执行。
-- [ ] 工具错误按类别进入正确恢复路径。
-- [ ] 进程崩溃后 Pending Delivery 可恢复。
-- [ ] 同会话在重试条件下仍保持顺序。
-- [ ] 幂等平台不重复发送；非幂等平台明确 At-Least-Once。
-- [ ] 文本、卡片、文件和降级渲染有契约测试。
-- [ ] 主动通知遵循订阅、静默、频率和去重。
-- [ ] 失败 Trace 可转为 Replay Case 并生成回归报告。
+- [x] 多账号、多用户和跨渠道 Session 边界测试通过。
+- [x] Interaction State 非法转换被拒绝。
+- [x] 长任务可进度反馈、取消、修改和恢复。
+- [x] 高风险动作无确认不可执行。
+- [x] 工具错误按类别进入正确恢复路径。
+- [x] 进程崩溃后 Pending Delivery 可恢复。
+- [x] 同会话在重试条件下仍保持顺序。
+- [x] 幂等平台不重复发送；非幂等平台明确 At-Least-Once。
+- [x] 文本、卡片、文件和降级渲染有契约测试。
+- [x] 主动通知遵循订阅、静默、频率和去重。
+- [x] 失败 Trace 可转为 Replay Case 并生成回归报告。
+
+验收证据：
+
+- Interaction State：`tests/test_interaction_state.py` 覆盖非法转换拒绝、revision 冲突、
+  原子事件持久化和中断任务恢复。
+- 长任务控制：`tests/test_production_interaction.py` 覆盖进度结果、协作取消、
+  Pause/Modify/Resume 以及恢复时的 Session Lane 顺序。
+- 主动通知：`tests/test_notification_policy.py` 覆盖订阅、过期、冷却、小时/日频控、
+  静默时段、显式高优先级绕过、去重、Digest、崩溃预留恢复和抑制不入队。
+- Trace/Replay：`tests/test_trace_replay_feedback.py` 覆盖失败 Trace 固化为 Replay Case、
+  JSON/Markdown 报告、逐 evaluator 结果以及 baseline/candidate 回归比较。

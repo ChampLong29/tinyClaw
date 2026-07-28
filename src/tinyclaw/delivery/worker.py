@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from enum import Enum
+from typing import Any, Protocol
 
 from tinyclaw.contracts._common import parse_datetime, require_text
 from tinyclaw.contracts.delivery import DeliveryRecord
@@ -33,6 +34,25 @@ class DeliverySender(Protocol):
     def send(self, record: DeliveryRecord) -> DeliveryReceipt: ...
 
 
+class DeliveryFaultPoint(str, Enum):
+    AFTER_CLAIM = "after_claim"
+    AFTER_SEND_BEFORE_SETTLE = "after_send_before_settle"
+    AFTER_SETTLE = "after_settle"
+
+
+class InjectedDeliveryCrash(BaseException):
+    """Test-only crash signal that deliberately bypasses delivery error handling."""
+
+
+class DeliveryFaultInjector(Protocol):
+    def __call__(
+        self,
+        point: DeliveryFaultPoint,
+        record: DeliveryRecord,
+        context: dict[str, Any],
+    ) -> None: ...
+
+
 class LeaseDeliveryWorker:
     def __init__(
         self,
@@ -43,6 +63,7 @@ class LeaseDeliveryWorker:
         lease_duration: timedelta = timedelta(seconds=30),
         retry_policy: DeliveryRetryPolicy | None = None,
         trace_recorder: TraceRecorder | None = None,
+        fault_injector: DeliveryFaultInjector | None = None,
     ) -> None:
         self.store = store
         self.sender = sender
@@ -50,6 +71,7 @@ class LeaseDeliveryWorker:
         self.lease_duration = lease_duration
         self.retry_policy = retry_policy or DeliveryRetryPolicy()
         self.trace_recorder = trace_recorder
+        self.fault_injector = fault_injector
         self.total_attempted = 0
         self.total_acked = 0
         self.total_failed = 0
@@ -69,10 +91,16 @@ class LeaseDeliveryWorker:
         )
         results: list[DeliveryRecord] = []
         for record in claimed:
+            self._inject(DeliveryFaultPoint.AFTER_CLAIM, record)
             self.total_attempted += 1
             self._trace("delivery_attempted", record)
             try:
                 receipt = self.sender.send(record)
+                self._inject(
+                    DeliveryFaultPoint.AFTER_SEND_BEFORE_SETTLE,
+                    record,
+                    receipt=receipt,
+                )
                 settled_at = current if now is not None else parse_datetime(None, default_now=True)
                 if receipt.confirmed:
                     updated = self.store.acknowledge(
@@ -109,8 +137,18 @@ class LeaseDeliveryWorker:
                     updated,
                     error={"type": type(exc).__name__, "message": str(exc)},
                 )
+            self._inject(DeliveryFaultPoint.AFTER_SETTLE, updated)
             results.append(updated)
         return results
+
+    def _inject(
+        self,
+        point: DeliveryFaultPoint,
+        record: DeliveryRecord,
+        **context: Any,
+    ) -> None:
+        if self.fault_injector is not None:
+            self.fault_injector(point, record, context)
 
     def _trace(
         self,
@@ -130,6 +168,12 @@ class LeaseDeliveryWorker:
             "sequence": record.sequence,
             "attempt_count": record.attempt_count,
             "state": record.state.value,
+            "idempotency_key": record.idempotency_key,
+            "delivery_semantics": (
+                metadata.get("delivery_semantics", "at_least_once")
+                if isinstance(metadata, dict)
+                else "at_least_once"
+            ),
         }
         if error is not None:
             payload["error"] = error

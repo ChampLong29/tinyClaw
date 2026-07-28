@@ -20,6 +20,7 @@ from tinyclaw.presentation.capability import (
 
 _FENCE_RE = re.compile(r"(^```[^\n]*\n.*?^```\s*$)", re.MULTILINE | re.DOTALL)
 _MARKDOWN_DECORATION_RE = re.compile(r"(\*\*|__|~~|(?<!`)`(?!`))")
+_MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\([^)]+\)")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -64,10 +65,15 @@ class OutboundRenderer:
     def render(self, intent: OutboundIntent) -> list[RenderedMessage]:
         capability = self.registry.get(intent.target.channel)
         snapshot = SemanticSnapshot.from_intent(intent)
-        text, output_format, degradation = self._render_blocks(
+        text, output_format, degradation, native_payload = self._render_blocks(
             intent.content_blocks,
             capability,
         )
+        delivery_mode = "send"
+        if intent.semantic_type.value == "progress":
+            delivery_mode = "update" if capability.progress_update else "milestone"
+            if not capability.progress_update:
+                degradation.append("progress_update_to_milestones")
         chunks = split_content_aware(text, capability.text_limit)
         return [
             RenderedMessage(
@@ -77,8 +83,10 @@ class OutboundRenderer:
                 chunk_count=len(chunks),
                 semantic_snapshot=snapshot,
                 metadata={
-                    "degradation": degradation,
+                    "degradation": tuple(degradation),
                     "semantic_type": intent.semantic_type.value,
+                    "delivery_mode": delivery_mode,
+                    "native_payload": native_payload if index == 0 else {},
                 },
             )
             for index, chunk in enumerate(chunks)
@@ -88,10 +96,16 @@ class OutboundRenderer:
         self,
         blocks: tuple[ContentBlock, ...],
         capability: ChannelCapability,
-    ) -> tuple[str, str, tuple[str, ...]]:
+    ) -> tuple[str, str, list[str], Mapping[str, Any]]:
         rendered: list[str] = []
         degradation: list[str] = []
         has_markdown = False
+        has_native_card = False
+        native_payload: dict[str, list[Mapping[str, Any]]] = {
+            "attachments": [],
+            "actions": [],
+            "cards": [],
+        }
         for block in blocks:
             if block.type == ContentBlockType.TEXT:
                 rendered.append(block.text or "")
@@ -103,11 +117,26 @@ class OutboundRenderer:
                     rendered.append(markdown_to_plain(block.text or ""))
                     degradation.append("markdown_to_text")
             elif block.type in (ContentBlockType.FILE, ContentBlockType.IMAGE):
-                rendered.append(self._render_artifact(block, capability))
                 supported = (
                     capability.file if block.type == ContentBlockType.FILE else capability.image
                 )
-                if not supported:
+                if supported:
+                    name = str(
+                        block.metadata.get("filename")
+                        or block.metadata.get("alt")
+                        or block.type.value
+                    )
+                    rendered.append(name)
+                    native_payload["attachments"].append(
+                        {
+                            "kind": block.type.value,
+                            "artifact_ref": block.artifact_ref,
+                            "mime_type": block.mime_type,
+                            "metadata": dict(block.metadata),
+                        }
+                    )
+                else:
+                    rendered.append(self._render_artifact(block, capability))
                     degradation.append(f"{block.type.value}_to_link")
             elif block.type == ContentBlockType.LINK:
                 label = block.text or str(block.metadata.get("label") or "链接")
@@ -116,10 +145,29 @@ class OutboundRenderer:
                 has_markdown = has_markdown or capability.markdown
             elif block.type == ContentBlockType.ACTIONS:
                 rendered.append(self._render_actions(block))
-                if not capability.buttons:
+                raw_actions = block.metadata.get("actions")
+                if capability.buttons and isinstance(raw_actions, list):
+                    native_payload["actions"].extend(
+                        dict(action) for action in raw_actions if isinstance(action, Mapping)
+                    )
+                else:
                     degradation.append("buttons_to_text")
+            elif block.type == ContentBlockType.CARD:
+                rendered.append(self._render_card(block, markdown=capability.markdown))
+                has_markdown = has_markdown or capability.markdown
+                if capability.card:
+                    native_payload["cards"].append(
+                        {"text": block.text, "metadata": dict(block.metadata)}
+                    )
+                    has_native_card = True
+                else:
+                    degradation.append(
+                        "card_to_markdown" if capability.markdown else "card_to_text"
+                    )
         text = "\n\n".join(part for part in rendered if part)
-        return text, "markdown" if has_markdown else "text", tuple(degradation)
+        compact_payload = {key: value for key, value in native_payload.items() if value}
+        output_format = "card" if has_native_card else ("markdown" if has_markdown else "text")
+        return text, output_format, degradation, compact_payload
 
     @staticmethod
     def _render_artifact(
@@ -145,6 +193,31 @@ class OutboundRenderer:
         ]
         visible = [label for label in labels if label]
         return "可选操作：" + " / ".join(visible) if visible else (block.text or "")
+
+    @staticmethod
+    def _render_card(block: ContentBlock, *, markdown: bool) -> str:
+        title = str(block.metadata.get("title") or "").strip()
+        body = str(block.text or block.metadata.get("body") or "").strip()
+        raw_fields = block.metadata.get("fields")
+        fields: list[tuple[str, str]] = []
+        if isinstance(raw_fields, Mapping):
+            fields = [(str(key), str(value)) for key, value in raw_fields.items()]
+        elif isinstance(raw_fields, list):
+            fields = [
+                (
+                    str(item.get("label") or item.get("name") or ""),
+                    str(item.get("value") or ""),
+                )
+                for item in raw_fields
+                if isinstance(item, Mapping)
+            ]
+        if markdown:
+            parts = [f"**{title}**" if title else "", body]
+            parts.extend(f"- **{label}**: {value}" for label, value in fields if label or value)
+        else:
+            parts = [title, body]
+            parts.extend(f"{label}: {value}" for label, value in fields if label or value)
+        return "\n".join(part for part in parts if part) or "卡片"
 
 
 def markdown_to_plain(text: str) -> str:
@@ -216,4 +289,11 @@ def _safe_cut(text: str, limit: int) -> int:
         text.rfind(" ", 0, limit + 1),
     ]
     cut = max(candidates)
-    return cut if cut > 0 else limit
+    cut = cut if cut > 0 else limit
+    for match in _MARKDOWN_LINK_RE.finditer(text):
+        if match.start() < cut < match.end():
+            if match.start() > 0:
+                return match.start()
+            if match.end() <= limit:
+                return match.end()
+    return cut

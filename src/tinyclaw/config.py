@@ -37,7 +37,14 @@ def load_config(env_path: Path | None = None) -> dict[str, Any]:
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "model_id": os.getenv("MODEL_ID", "claude-sonnet-4-20250514"),
         "anthropic_base_url": os.getenv("ANTHROPIC_BASE_URL") or None,
-        "workspace_dir": Path(os.getenv("WORKSPACE_DIR", str(Path(__file__).parent.parent.parent.parent / "workspace"))),
+        "workspace_dir": Path(
+            os.getenv(
+                "WORKSPACE_DIR", str(Path(__file__).parent.parent.parent.parent / "workspace")
+            )
+        ),
+        "session_scope": os.getenv("SESSION_SCOPE", "per-account-channel-peer").strip().lower(),
+        "session_scope_version": int(os.getenv("SESSION_SCOPE_VERSION", "1") or "1"),
+        "confirmation_token_secret": os.getenv("CONFIRMATION_TOKEN_SECRET", "").strip(),
         # Telegram
         "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         "telegram_allowed_chats": os.getenv("TELEGRAM_ALLOWED_CHATS", ""),
@@ -66,14 +73,20 @@ def load_config(env_path: Path | None = None) -> dict[str, Any]:
         "workwechat_mode": os.getenv("WORKWECHAT_MODE", "off").strip().lower(),
         "workwechat_bot_id": os.getenv("WORKWECHAT_BOT_ID", "").strip(),
         "workwechat_bot_secret": os.getenv("WORKWECHAT_BOT_SECRET", "").strip(),
-        "workwechat_ws_url": os.getenv("WORKWECHAT_WS_URL", "wss://openws.work.weixin.qq.com").strip(),
-        "workwechat_ping_interval_sec": int(os.getenv("WORKWECHAT_PING_INTERVAL_SEC", "30") or "30"),
+        "workwechat_ws_url": os.getenv(
+            "WORKWECHAT_WS_URL", "wss://openws.work.weixin.qq.com"
+        ).strip(),
+        "workwechat_ping_interval_sec": int(
+            os.getenv("WORKWECHAT_PING_INTERVAL_SEC", "30") or "30"
+        ),
         "workwechat_corp_id": os.getenv("WORKWECHAT_CORP_ID", "").strip(),
         "workwechat_corp_secret": os.getenv("WORKWECHAT_CORP_SECRET", "").strip(),
         "workwechat_agent_id": int(os.getenv("WORKWECHAT_AGENT_ID", "0") or "0"),
         "workwechat_webhook_host": os.getenv("WORKWECHAT_WEBHOOK_HOST", "0.0.0.0").strip(),
         "workwechat_webhook_port": int(os.getenv("WORKWECHAT_WEBHOOK_PORT", "8767")),
-        "workwechat_webhook_path": os.getenv("WORKWECHAT_WEBHOOK_PATH", "/workwechat/events").strip(),
+        "workwechat_webhook_path": os.getenv(
+            "WORKWECHAT_WEBHOOK_PATH", "/workwechat/events"
+        ).strip(),
         "workwechat_webhook_token": os.getenv("WORKWECHAT_WEBHOOK_TOKEN", "").strip(),
         # DingTalk (钉钉)
         "dingtalk_mode": os.getenv("DINGTALK_MODE", "off").strip().lower(),

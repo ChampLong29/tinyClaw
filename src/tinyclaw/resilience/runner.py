@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from anthropic import Anthropic
 
+from tinyclaw.pause_signals import InteractionPauseSignal, ToolRuntimeFailure
 from tinyclaw.resilience.failover import (
-    FailoverReason, ProfileManager, classify_failure,
+    FailoverReason,
+    ProfileManager,
+    classify_failure,
 )
 from tinyclaw.session.context_guard import ContextGuard
-
 
 MAX_OVERFLOW_COMPACTION = 3
 BASE_RETRY = 24
@@ -21,14 +22,17 @@ BASE_RETRY = 24
 @dataclass
 class SimulatedFailure:
     """Arm a simulated failure for testing retry behavior."""
-    TEMPLATES: dict[str, str] = field(default_factory=lambda: {
-        "rate_limit": "Error code: 429 -- rate limit exceeded",
-        "auth": "Error code: 401 -- authentication failed",
-        "timeout": "Request timed out after 30s",
-        "billing": "Error code: 402 -- billing quota exceeded",
-        "overflow": "Error: context window token overflow",
-        "unknown": "Error: unexpected internal server error",
-    })
+
+    TEMPLATES: dict[str, str] = field(
+        default_factory=lambda: {
+            "rate_limit": "Error code: 429 -- rate limit exceeded",
+            "auth": "Error code: 401 -- authentication failed",
+            "timeout": "Request timed out after 30s",
+            "billing": "Error code: 402 -- billing quota exceeded",
+            "overflow": "Error: context window token overflow",
+            "unknown": "Error: unexpected internal server error",
+        }
+    )
 
     _pending: str | None = None
 
@@ -112,13 +116,19 @@ class ResilienceRunner:
                         self.simulated_failure.check_and_fire()
 
                     result, updated = self._tool_loop(
-                        api_client, self.model_id, system,
-                        current_messages, tools, tool_handler,
+                        api_client,
+                        self.model_id,
+                        system,
+                        current_messages,
+                        tools,
+                        tool_handler,
                     )
                     self.profile_manager.mark_success(profile)
                     self.total_successes += 1
                     return result, updated
 
+                except (InteractionPauseSignal, ToolRuntimeFailure):
+                    raise
                 except Exception as exc:
                     reason = classify_failure(exc)
                     self.total_failures += 1
@@ -166,12 +176,18 @@ class ResilienceRunner:
                     if self.simulated_failure:
                         self.simulated_failure.check_and_fire()
                     result, updated = self._tool_loop(
-                        api_client, fallback_model, system,
-                        current_messages, tools, tool_handler,
+                        api_client,
+                        fallback_model,
+                        system,
+                        current_messages,
+                        tools,
+                        tool_handler,
                     )
                     self.profile_manager.mark_success(profile)
                     self.total_successes += 1
                     return result, updated
+                except (InteractionPauseSignal, ToolRuntimeFailure):
+                    raise
                 except Exception:
                     self.total_failures += 1
                     continue
@@ -201,10 +217,12 @@ class ResilienceRunner:
                 tools=tools,
                 messages=current_messages,
             )
-            current_messages.append({
-                "role": "assistant",
-                "content": response.content,
-            })
+            current_messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.content,
+                }
+            )
 
             if response.stop_reason == "end_turn":
                 return response, current_messages
@@ -215,11 +233,13 @@ class ResilienceRunner:
                     if block.type != "tool_use":
                         continue
                     result = tool_handler(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        }
+                    )
                 current_messages.append({"role": "user", "content": tool_results})
                 continue
 

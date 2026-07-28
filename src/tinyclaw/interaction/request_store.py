@@ -19,6 +19,7 @@ class RequestState(str, Enum):
     OPEN = "open"
     ANSWERED = "answered"
     APPROVED = "approved"
+    CONSUMED = "consumed"
     DENIED = "denied"
     MODIFIED = "modified"
     EXPIRED = "expired"
@@ -82,6 +83,7 @@ class ConfirmationRequest:
     task_id: str
     session_id: str
     global_user_id: str
+    action: Mapping[str, Any]
     action_summary: str
     action_digest: str
     risk_level: RiskLevel
@@ -207,6 +209,18 @@ class SQLiteRequestStore:
             raise RequestNotFoundError(request_id)
         return self._from_row(row)
 
+    def list_for_task(self, task_id: str) -> list[InteractionRequest]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM interaction_requests
+                WHERE task_id = ?
+                ORDER BY created_at ASC, request_id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
     def update(
         self,
         request: InteractionRequest,
@@ -236,9 +250,7 @@ class SQLiteRequestStore:
                 ),
             )
         if cursor.rowcount != 1:
-            raise RequestRevisionConflictError(
-                f"request {request.request_id!r} revision changed"
-            )
+            raise RequestRevisionConflictError(f"request {request.request_id!r} revision changed")
         return request
 
     def resolve(
@@ -305,6 +317,7 @@ class SQLiteRequestStore:
             task_id=data["task_id"],
             session_id=data["session_id"],
             global_user_id=data["global_user_id"],
+            action=data.get("action", {}),
             action_summary=data["action_summary"],
             action_digest=data["action_digest"],
             risk_level=RiskLevel(data["risk_level"]),

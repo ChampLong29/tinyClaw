@@ -52,6 +52,62 @@ def test_subscription_and_expiry_precede_other_policy_checks(tmp_path: Path):
         policy.close()
 
 
+def test_expiry_cooldown_and_frequency_limits_are_enforced(tmp_path: Path):
+    now = datetime(2026, 7, 28, 12, tzinfo=timezone.utc)
+
+    expiry_policy = SQLiteNotificationPolicy(tmp_path / "expiry.db")
+    cooldown_policy = SQLiteNotificationPolicy(
+        tmp_path / "cooldown.db",
+        config=NotificationPolicyConfig(cooldown_seconds=60),
+    )
+    hourly_policy = SQLiteNotificationPolicy(
+        tmp_path / "hourly.db",
+        config=NotificationPolicyConfig(per_hour_limit=1, per_day_limit=5),
+    )
+    daily_policy = SQLiteNotificationPolicy(
+        tmp_path / "daily.db",
+        config=NotificationPolicyConfig(per_hour_limit=5, per_day_limit=1),
+    )
+    try:
+        expired = expiry_policy.evaluate(
+            make_request(expires_at=now - timedelta(seconds=1)),
+            now=now,
+        )
+        assert expired.reason == NotificationReason.EXPIRED
+
+        cooldown_first = cooldown_policy.evaluate(make_request(), now=now)
+        cooldown_policy.commit(cooldown_first)
+        cooldown_second = cooldown_policy.evaluate(
+            make_request(request_id="cooldown-2", dedupe_key="cooldown-2"),
+            now=now + timedelta(seconds=30),
+        )
+        assert cooldown_second.reason == NotificationReason.COOLDOWN
+
+        hourly_first = hourly_policy.evaluate(make_request(), now=now)
+        hourly_policy.commit(hourly_first)
+        hourly_second = hourly_policy.evaluate(
+            make_request(request_id="hourly-2", dedupe_key="hourly-2"),
+            now=now + timedelta(minutes=1),
+        )
+        assert hourly_second.reason == NotificationReason.HOURLY_LIMIT
+
+        daily_first = daily_policy.evaluate(
+            make_request(),
+            now=now - timedelta(hours=2),
+        )
+        daily_policy.commit(daily_first)
+        daily_second = daily_policy.evaluate(
+            make_request(request_id="daily-2", dedupe_key="daily-2"),
+            now=now,
+        )
+        assert daily_second.reason == NotificationReason.DAILY_LIMIT
+    finally:
+        expiry_policy.close()
+        cooldown_policy.close()
+        hourly_policy.close()
+        daily_policy.close()
+
+
 def test_dedupe_survives_restart_after_enqueue_commit(tmp_path: Path):
     db_path = tmp_path / "notifications.db"
     now = datetime(2026, 7, 28, tzinfo=timezone.utc)

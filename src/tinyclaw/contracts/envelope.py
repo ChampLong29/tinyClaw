@@ -32,6 +32,7 @@ class ContentBlockType(str, Enum):
     FILE = "file"
     LINK = "link"
     ACTIONS = "actions"
+    CARD = "card"
 
 
 class SemanticType(str, Enum):
@@ -196,9 +197,7 @@ class InboundEnvelope:
             content_blocks=tuple(
                 ContentBlock.from_dict(item) for item in data.get("content_blocks") or ()
             ),
-            attachments=tuple(
-                Attachment.from_dict(item) for item in data.get("attachments") or ()
-            ),
+            attachments=tuple(Attachment.from_dict(item) for item in data.get("attachments") or ()),
             reply_to=data.get("reply_to"),
             received_at=parse_datetime(data.get("received_at"), default_now=True),
             channel_metadata=dict(data.get("channel_metadata") or {}),

@@ -17,6 +17,7 @@ class ChannelCapability:
     image: bool = False
     thread_reply: bool = False
     delivery_receipt: bool = False
+    outbound_idempotency: bool = False
 
     def __post_init__(self) -> None:
         if self.text_limit <= 0:
@@ -34,24 +35,15 @@ CHANNEL_CAPABILITIES: dict[str, ChannelCapability] = {
     "console": ChannelCapability(text_limit=16_384, markdown=True),
     "telegram": ChannelCapability(
         text_limit=4096,
-        image=True,
-        file=True,
         thread_reply=True,
         delivery_receipt=True,
     ),
     "feishu": ChannelCapability(
         text_limit=4000,
-        image=True,
-        file=True,
         delivery_receipt=True,
     ),
-    "workwechat": ChannelCapability(
-        text_limit=4000,
-        image=True,
-        file=True,
-        delivery_receipt=True,
-    ),
-    "wecomcli": ChannelCapability(text_limit=4000, image=True, file=True),
+    "workwechat": ChannelCapability(text_limit=4000),
+    "wecomcli": ChannelCapability(text_limit=4000),
     "dingtalk": ChannelCapability(text_limit=4000),
 }
 

@@ -6,7 +6,9 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Mapping
 
 from tinyclaw.contracts._common import parse_datetime, require_text, utc_now
@@ -42,6 +44,35 @@ def compute_action_digest(action: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def load_or_create_confirmation_secret(
+    workspace: Path,
+    configured_secret: str | None = None,
+) -> str:
+    """Load a stable signer secret, creating a workspace-local one when absent."""
+    if configured_secret:
+        if len(configured_secret.encode("utf-8")) < 16:
+            raise ValueError("CONFIRMATION_TOKEN_SECRET must be at least 16 bytes")
+        return configured_secret
+    secret_path = workspace / ".confirmation-token-secret"
+    try:
+        stored = secret_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        stored = ""
+    if stored:
+        if len(stored.encode("utf-8")) < 16:
+            raise ValueError(f"invalid confirmation secret in {secret_path}")
+        return stored
+
+    candidate = secrets.token_urlsafe(32)
+    secret_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with secret_path.open("x", encoding="utf-8") as handle:
+            handle.write(candidate)
+    except FileExistsError:
+        candidate = secret_path.read_text(encoding="utf-8").strip()
+    return candidate
 
 
 class ConfirmationTokenSigner:
@@ -104,6 +135,7 @@ class ConfirmationService:
             task_id=task.task_id,
             session_id=task.session_id,
             global_user_id=global_user_id,
+            action=dict(action),
             action_summary=action_summary,
             action_digest=compute_action_digest({"action": action, "scope": dict(scope)}),
             risk_level=risk_level,
@@ -136,7 +168,7 @@ class ConfirmationService:
         session_id: str,
         global_user_id: str,
         action_token: str,
-        action: Mapping[str, Any],
+        action: Mapping[str, Any] | None = None,
         decision: ConfirmationDecision,
         actor: str,
         modification: Mapping[str, Any] | None = None,
@@ -149,9 +181,13 @@ class ConfirmationService:
         if request.expires_at <= utc_now():
             self._expire(request, actor=actor)
             raise RequestExpiredError(request.request_id)
-        if compute_action_digest(
-            {"action": action, "scope": dict(request.scope)}
-        ) != request.action_digest:
+        resolved_action = dict(action) if action is not None else dict(request.action)
+        if not resolved_action:
+            raise ValueError("confirmation request does not contain a persisted action")
+        if (
+            compute_action_digest({"action": resolved_action, "scope": dict(request.scope)})
+            != request.action_digest
+        ):
             raise ActionDigestMismatchError("confirmed action parameters changed")
         if not self.signer.verify(request, action_token):
             raise InvalidConfirmationTokenError("invalid confirmation token")
@@ -171,15 +207,51 @@ class ConfirmationService:
             modification=dict(modification) if modification else None,
         )
         task = self.state_machine.store.get_task(request.task_id)
+        target_state = (
+            TaskState.CANCELLED if decision == ConfirmationDecision.DENY else TaskState.RUNNING
+        )
         self.state_machine.transition(
             task.task_id,
-            TaskState.RUNNING,
+            target_state,
             actor=actor,
             reason=f"confirmation_{decision.value}",
             expected_revision=task.revision,
             pending_request_ref=None,
         )
         return resolved
+
+    def consume_approval(
+        self,
+        request_id: str,
+        *,
+        session_id: str,
+        global_user_id: str,
+        action: Mapping[str, Any],
+    ) -> ConfirmationRequest:
+        """Atomically consume an exact approve-once grant before execution."""
+        request = self.request_store.get(request_id)
+        if not isinstance(request, ConfirmationRequest):
+            raise TypeError("request is not a confirmation")
+        self._authorize(request, session_id, global_user_id)
+        if request.state != RequestState.APPROVED:
+            raise RequestAlreadyResolvedError(request.request_id)
+        if request.expires_at <= utc_now():
+            self.request_store.resolve(
+                request,
+                state=RequestState.EXPIRED,
+                expected_revision=request.revision,
+            )
+            raise RequestExpiredError(request.request_id)
+        if (
+            compute_action_digest({"action": action, "scope": dict(request.scope)})
+            != request.action_digest
+        ):
+            raise ActionDigestMismatchError("approved action parameters changed")
+        return self.request_store.resolve(
+            request,
+            state=RequestState.CONSUMED,
+            expected_revision=request.revision,
+        )
 
     def expire(self, request_id: str, *, actor: str = "system") -> ConfirmationRequest:
         request = self.request_store.get(request_id)

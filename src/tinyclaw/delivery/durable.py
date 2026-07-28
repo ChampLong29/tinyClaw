@@ -103,6 +103,11 @@ class DurableDeliveryQueue:
         metadata = dict(meta or {})
         metadata.setdefault("intent_id", intent.intent_id)
         metadata.setdefault("semantic_type", intent.semantic_type.value)
+        capability = self.renderer.registry.get(intent.target.channel)
+        metadata.setdefault(
+            "delivery_semantics",
+            "idempotent_retry" if capability.outbound_idempotency else "at_least_once",
+        )
         lane_key = str(
             metadata.get("lane_key")
             or (f"{intent.target.channel}:{intent.target.account_id}:{intent.target.peer_id}")
@@ -167,6 +172,8 @@ class DurableDeliveryQueue:
                     **metadata,
                     "chunk_index": message.chunk_index,
                     "chunk_count": message.chunk_count,
+                    "format": message.format,
+                    "render_metadata": dict(message.metadata),
                 },
                 "semantic_snapshot": {
                     "semantic_type": message.semantic_snapshot.semantic_type,
@@ -307,6 +314,9 @@ class _CallbackSender:
     def send(self, record: DeliveryRecord) -> DeliveryReceipt:
         metadata = record.payload.get("meta")
         meta = dict(metadata) if isinstance(metadata, dict) else {}
+        meta.setdefault("delivery_id", record.delivery_id)
+        meta.setdefault("idempotency_key", record.idempotency_key)
+        meta.setdefault("delivery_semantics", "at_least_once")
         return self.deliver_fn(
             record.target.channel,
             record.target.peer_id,

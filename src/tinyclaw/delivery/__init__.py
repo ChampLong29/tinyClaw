@@ -16,11 +16,17 @@ from tinyclaw.delivery.store import (
     DeliveryNotFoundError,
     SQLiteDeliveryStore,
 )
-from tinyclaw.delivery.worker import DeliveryReceipt, LeaseDeliveryWorker
+from tinyclaw.delivery.worker import (
+    DeliveryFaultPoint,
+    DeliveryReceipt,
+    InjectedDeliveryCrash,
+    LeaseDeliveryWorker,
+)
 
 __all__ = [
     "CHANNEL_LIMITS",
     "DeliveryIdempotencyConflictError",
+    "DeliveryFaultPoint",
     "DeliveryLeaseConflictError",
     "DeliveryNotFoundError",
     "DeliveryQueue",
@@ -29,6 +35,7 @@ __all__ = [
     "DeliveryRunner",
     "DurableDeliveryQueue",
     "DurableDeliveryRunner",
+    "InjectedDeliveryCrash",
     "LegacyDeliveryMigrator",
     "LegacyMigrationReport",
     "LeaseDeliveryWorker",

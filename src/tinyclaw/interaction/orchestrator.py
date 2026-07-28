@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, Mapping
 
 from tinyclaw.contracts.interaction import (
@@ -24,6 +24,7 @@ from tinyclaw.runtime.port import RuntimeEvent, RuntimeEventType, RuntimePort, T
 
 ProgressSink = Callable[[ProgressEvent], None]
 ConfirmationSink = Callable[[str, str], None]
+ClarificationSink = Callable[[str], None]
 
 
 class InteractionOrchestrator:
@@ -39,6 +40,7 @@ class InteractionOrchestrator:
         progress_coalescer: ProgressCoalescer | None = None,
         progress_sink: ProgressSink | None = None,
         confirmation_sink: ConfirmationSink | None = None,
+        clarification_sink: ClarificationSink | None = None,
     ) -> None:
         self.state_machine = state_machine
         self.runtime = runtime
@@ -47,6 +49,7 @@ class InteractionOrchestrator:
         self.progress_coalescer = progress_coalescer or ProgressCoalescer()
         self.progress_sink = progress_sink
         self.confirmation_sink = confirmation_sink
+        self.clarification_sink = clarification_sink
 
     def start(
         self,
@@ -66,17 +69,74 @@ class InteractionOrchestrator:
             task_id=task_id,
             trace_id=trace_id,
         )
-        task = self.state_machine.transition(
+        return self.run_existing(
             task.task_id,
-            TaskState.RUNNING,
-            actor="orchestrator",
-            reason="runtime_started",
-            expected_revision=task.revision,
+            global_user_id=global_user_id,
             trace_id=trace_id,
         )
+
+    def run_existing(
+        self,
+        task_id: str,
+        *,
+        global_user_id: str,
+        trace_id: str | None = None,
+    ) -> TaskInstance:
+        """Run a task durably submitted before it enters an execution lane."""
+        task = self.state_machine.store.get_task(task_id)
+        if task.state == TaskState.QUEUED:
+            task = self.state_machine.transition(
+                task.task_id,
+                TaskState.RUNNING,
+                actor="orchestrator",
+                reason="runtime_started",
+                expected_revision=task.revision,
+                trace_id=trace_id,
+            )
+        elif task.state != TaskState.RUNNING:
+            return task
+        return self._consume(
+            task,
+            lambda: self.runtime.start(self._context(task, trace_id)),
+            global_user_id=global_user_id,
+            trace_id=trace_id,
+        )
+
+    def resume(
+        self,
+        task_id: str,
+        *,
+        global_user_id: str,
+        trace_id: str | None = None,
+    ) -> TaskInstance:
+        """Resume an authorized RUNNING task through the Runtime Port."""
+        task = self.state_machine.store.get_task(task_id)
+        if task.state != TaskState.RUNNING:
+            return task
         context = self._context(task, trace_id)
+
+        def events_factory() -> Iterable[RuntimeEvent]:
+            if task.checkpoint_ref:
+                return self.runtime.resume(context, task.checkpoint_ref)
+            return self.runtime.start(context)
+
+        return self._consume(
+            task,
+            events_factory,
+            global_user_id=global_user_id,
+            trace_id=trace_id,
+        )
+
+    def _consume(
+        self,
+        task: TaskInstance,
+        events_factory: Callable[[], Iterable[RuntimeEvent]],
+        *,
+        global_user_id: str,
+        trace_id: str | None,
+    ) -> TaskInstance:
         try:
-            for event in self.runtime.start(context):
+            for event in events_factory():
                 task = self._handle_event(
                     task,
                     event,
@@ -101,7 +161,7 @@ class InteractionOrchestrator:
                         retryable=False,
                     ),
                 )
-            raise
+            return current
 
         current = self.state_machine.store.get_task(task.task_id)
         if current.state == TaskState.RUNNING:
@@ -150,7 +210,7 @@ class InteractionOrchestrator:
         if event.type == RuntimeEventType.CLARIFICATION:
             if self.clarification_service is None:
                 raise RuntimeError("runtime requested clarification but no service is configured")
-            self.clarification_service.open(
+            request = self.clarification_service.open(
                 task_id=task.task_id,
                 global_user_id=global_user_id,
                 question=str(event.payload["question"]),
@@ -159,6 +219,8 @@ class InteractionOrchestrator:
                 expires_at=event.payload.get("expires_at"),
                 default_action=str(event.payload.get("default_action") or "cancel"),
             )
+            if self.clarification_sink:
+                self.clarification_sink(request.request_id)
             return self.state_machine.store.get_task(task.task_id)
         if event.type == RuntimeEventType.CONFIRMATION:
             if self.confirmation_service is None:
