@@ -1,105 +1,132 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file contains repository guidance for coding agents. User-facing setup and architecture documentation
+live in `README.md`.
 
-## Project Overview
+## Project shape
 
-**tinyClaw** is an educational project that teaches how to build a production-grade AI Agent Gateway from scratch through 10 progressive, runnable Python files. Each section adds exactly one new concept while keeping all prior code intact.
+tinyClaw has two intentionally separate parts:
 
-The project has two parallel structures:
-- `sessions/zh/` - Learning path (10 progressive teaching files, Chinese)
-- `src/tinyclaw/` - Production project (modular code by feature)
+- `src/tinyclaw/` and `main.py`: the production multi-channel Agent Gateway.
+- `sessions/zh/`: progressive teaching snapshots. They are historical learning material, not the source of
+  truth for production behavior or the default Ruff baseline.
 
-## Common Commands
+## Common commands
 
 ```bash
-# Install dependencies (uv is the only package manager — no requirements.txt)
-uv sync
-
-# Optional extras
-uv sync --extra dev        # pytest + ruff
-uv sync --extra telegram   # python-telegram-bot
-
-# Configure environment
+uv sync --extra dev
 cp .env.example .env
-# Edit .env with ANTHROPIC_API_KEY and MODEL_ID
 
-# Run learning sections
-python sessions/zh/s01_agent_loop.py
-python sessions/zh/s02_tool_use.py
-# ... through s10_concurrency.py
+uv run tinyclaw --mode cli
+uv run tinyclaw --mode server --host localhost --port 8765
 
-# Run production project
-python main.py --mode cli       # CLI REPL with /status, /cron, /lanes, etc.
-python main.py --mode server    # Multi-channel + gateway + background tasks (heartbeat/cron/delivery)
-python main.py --mode server --port 8877   # Custom gateway WebSocket port
+uv run pytest -q
+uv run ruff check main.py src tests
+uv run ruff format --check main.py src tests
+
+uv run python -m tinyclaw.delivery.acceptance
 ```
 
-## Architecture
+The runtime requires `ANTHROPIC_API_KEY`. `ANTHROPIC_BASE_URL` is only valid for endpoints compatible
+with the Anthropic Messages API wire protocol.
 
-The project builds an AI Agent Gateway layer by layer:
+## Production architecture
 
+```text
+Channel/WebSocket Inbound
+  → Binding Route
+  → Global Identity + Versioned Session Policy
+  → Persistent Task / Interaction State
+  → Per-Session CommandQueue Lane
+  → Agent Runtime + Tool Recovery + Confirmation Gate
+  → Outbound Intent + Capability Renderer
+  → SQLite Delivery Store + Lease Worker + Channel Receipt
+  → Trace / Artifact / Feedback / Replay
 ```
-s01: Agent Loop      - while True + stop_reason (the foundation)
-s02: Tool Use       - dispatch table for model-called tools
-s03: Sessions       - JSONL persistence, context overflow handling
-s04: Channels       - Telegram / Feishu / WorkWeChat / DingTalk / WeCom CLI adapters
-s05: Gateway        - 5-tier routing, session isolation
-s06: Intelligence   - soul, memory, skills, 8-layer prompt assembly, reminders
-s07: Heartbeat      - proactive agent + cron scheduler
-s08: Delivery       - write-ahead queue with backoff
-s09: Resilience     - 3-layer retry, auth profile rotation
-s10: Concurrency    - named lanes with FIFO queues
-```
 
-Section dependencies:
-- s01 → s02 → s03 → s04 → s05
-- s03 → s06 → s07 → s08
-- s06,s03 → s09 → s10
+Key modules:
 
-## Production Project Structure (`src/tinyclaw/`)
-
-```
+```text
 src/tinyclaw/
-├── config.py           # .env configuration loading (all channel env vars)
-├── client.py           # Anthropic client factory
-├── utils/              # ANSI colors, timezone (Beijing time formatting)
-├── agent/              # Agent loop + ToolDispatcher (register_builtin + register)
-├── session/            # JSONL store + context guard
-├── channel/            # Telegram / Feishu / WorkWeChat / DingTalk / WeComCLI adapters
-├── gateway/            # 5-tier BindingTable routing + WebSocket JSON-RPC server
-├── intelligence/       # soul / memory / skills / prompt builder / reminder store
-├── scheduler/          # heartbeat + cron
-├── delivery/           # WAL queue + chunker + runner
-├── resilience/         # 3-layer retry (ResilienceRunner) + auth rotation
-└── concurrency/        # named FIFO lanes (CommandQueue)
+├── agent/           Agent loop and tool dispatcher
+├── channel/         Telegram, Feishu, Work WeChat, DingTalk, WeCom CLI
+├── concurrency/     Named FIFO execution lanes
+├── contracts/       Versioned envelope, identity, task, delivery, trace contracts
+├── delivery/        SQLite store, durable facade, lease worker, acceptance drill
+├── gateway/         Binding route and WebSocket JSON-RPC
+├── identity/        Global identity links and session resolution
+├── interaction/     Task state, control, clarification, confirmation, production bridge
+├── notification/    Subscription, quiet hours, rate limits, dedupe, digest
+├── observability/   Trace, artifacts, feedback, Bad Cases
+├── presentation/    Channel capability registry and renderer
+├── replay/          Replay cases, evaluators, reports
+├── resilience/      Model and tool recovery
+├── runtime/         Runtime port and classified tool executor
+├── scheduler/       Heartbeat and Cron
+└── session/         Append-only JSONL conversation history
 ```
 
-## Key Patterns
+## Important invariants
 
-- **Agent Loop**: `messages[]` accumulates history, `stop_reason` controls flow (`end_turn` vs `tool_use`)
-- **Tool Dispatch**: `ToolDispatcher` with `register_builtin()` for built-in tools + `register()` for custom tools; model picks name, dispatcher looks up handler
-- **Session Storage**: JSONL append-only, replay on read, summarize for overflow. Session keys are persisted in `session_key_map.json`. Hot path uses in-memory cache (`session_cache` dict) — disk is only read on cold start
-- **Channel Abstraction**: All platforms produce standardized `InboundMessage` via `ChannelManager`. Async channels (Feishu long connection, WorkWeChat long connection, DingTalk long connection) use `register_async()`; sync channels (Telegram polling, WeCom CLI polling, webhooks) use `register()`
-- **Prompt Assembly**: 8-layer stack built via `build_static_prefix()` (Layers 1-6, cached at startup) + dynamic suffix (memory context, runtime context, channel hints). Static prefix is passed as a `cache_control`-marked content block to enable Anthropic prompt caching
-- **Prompt Caching**: `_static_prefix` is built once at startup and never changes across turns. It's wrapped in `{"type": "text", "text": ..., "cache_control": {"type": "ephemeral"}}` and passed to the API as a content block list, allowing the LLM provider to cache KV states and skip prefill on subsequent turns
-- **Named Lanes**: Concurrency isolation via FIFO queues per `(channel, peer)` pair, managed by `CommandQueue` with `LANE_MAIN`, `LANE_CRON`, `LANE_HEARTBEAT`
-- **Run Modes**: `--mode cli` (single-user REPL, stdin/stdout) vs `--mode server` (all channels active, background threads for heartbeat/cron/delivery/reminder-check)
-- **Reminder System**: `ReminderStore` persists reminders to workspace, `reminder_check_loop` polls and enqueues due reminders to delivery. Model can call `reminder_write`/`reminder_list` tools
-- **Timezone**: All user-facing time is formatted to Beijing time (UTC+8) via `utils/timezone.py`
+- Identity/session boundaries include channel and account by default. Never merge histories implicitly.
+  Explicit link, unlink, merge, and policy-version changes must remain audited.
+- Persist a Task before scheduling execution. Use `session_lane_name(session_id)` so the same session is
+  serial while different sessions can run concurrently.
+- Task transitions are revisioned and atomic with their interaction event. Reject illegal transitions and
+  stale revisions.
+- High-risk tool calls require an exact action/scope digest and a signed approve-once token. Consume the
+  authorization before dispatch.
+- Only retry tools automatically when the operation is read-only or idempotent. Unknown/partial side
+  effects must wait for user action.
+- All Heartbeat, Cron, and Reminder notifications go through `NotificationGateway`. Suppressed requests
+  never enter the delivery queue.
+- Production outbound messages go through `DurableDeliveryQueue` and `LeaseDeliveryWorker`. The legacy
+  file queue is migration input only.
+- Preserve FIFO by allowing only the earliest unfinished sequence in a lane to be claimed.
+- `acked` requires a durable platform message ID. Adapter acceptance without an ID is
+  `accepted_unconfirmed` and remains At-Least-Once.
+- Reuse the same idempotency key across retries. Never claim Exactly Once for platforms that cannot
+  enforce it.
+- Renderer capabilities must describe actual Sender behavior. Persist the semantic snapshot and render
+  metadata with every delivery chunk.
+- Trace recording must not break the task, notification, or delivery main path. Large values belong in
+  Artifact storage.
 
-## Run Mode Differences
+## Runtime data
 
-| Feature | `--mode cli` | `--mode server` |
-|---|---|---|
-| CLI REPL | Yes | No |
-| Telegram polling | No | Yes (if token configured) |
-| Feishu long connection / webhook | No | Yes (if configured) |
-| WorkWeChat long connection / webhook | No | Yes (if configured) |
-| DingTalk long connection / webhook | No | Yes (if configured) |
-| WeCom CLI polling | No | Yes (if poll enabled) |
-| WebSocket gateway | No | Yes |
-| Heartbeat + Cron | No | Yes |
-| Delivery queue | Yes (console only) | Yes (all channels) |
-| Reminder check loop | Yes (console only) | Yes (all channels) |
-| WeCom CLI as callable tool | Yes | Yes |
+The default `workspace/` contains:
+
+- `.sessions/agents/main/sessions/`: JSONL conversation history.
+- `identity.db`: identities, links, session policy audit.
+- `interaction.db`: tasks, state events, clarification and confirmation requests.
+- `delivery.db`: ordered delivery records, leases, ACKs and dead letters.
+- `notifications.db`: notification decisions, reservations and dedupe.
+- `feedback.db`: feedback and Bad Cases.
+- `observability/` and `interaction-artifacts/`: traces and artifacts.
+
+Do not commit runtime databases, generated reports, secrets, or channel credentials.
+
+## Validation expectations
+
+For production changes, run focused tests first, then:
+
+```bash
+uv run pytest -q
+uv run ruff check main.py src tests
+uv run ruff format --check main.py src tests
+```
+
+Known baseline as of 2026-08-03: tests pass, while the full production Ruff run still reports 20
+fixable lint diagnostics (`I001` 12, `F401` 7, `F841` 1) and 26 files with formatting drift. Do not
+weaken Ruff configuration or claim the baseline is green. Keep touched Python files clean and reduce the
+baseline intentionally in a separate mechanical change.
+
+For delivery changes, also run:
+
+```bash
+uv run python -m tinyclaw.delivery.acceptance
+```
+
+The current automated acceptance target is documented in
+`docs/roadmap/resume-target-requirements.md`. Real external-platform fault drills are manual and must use
+dedicated sandbox accounts and targets.

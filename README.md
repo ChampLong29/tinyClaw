@@ -1,550 +1,323 @@
 # tinyClaw
 
-**从零构建生产级 AI Agent Gateway**
+tinyClaw 是一个本地优先、可恢复的多渠道 AI Agent Gateway。生产代码位于
+`src/tinyclaw/`，提供身份与会话边界、持久化任务交互、可靠有序投递、主动通知治理、
+Trace/Replay，以及 CLI、WebSocket、Telegram、飞书、企业微信和钉钉接入。
 
-> 10 个递进章节，每章一个可运行的 Python 文件。
-> 简体中文代码 + 文档并排放置。
+仓库同时保留 `sessions/zh/` 教学系列。教学代码用于逐章学习，生产能力和运行说明以本
+README、`main.py`、`src/tinyclaw/` 与 `docs/roadmap/` 为准。
 
----
+## 当前状态
 
-## 两个部分
+截至 2026-08-03：
 
-本仓库包含两个并行结构：
+- 需求验收清单：11/11。
+- 自动化测试：109 项。
+- 离线可靠投递演练：4/4 场景通过。
+- 代码级目标态已完成；尚未执行各真实平台的专用沙箱网络、Auth 过期和 ACK 丢失演练。
+- 历史静态检查债务尚未清零：生产目录有 20 条 Ruff lint 诊断，完整格式检查涉及
+  26 个文件；教学系列不计入该数字。
 
-### 1. `sessions/zh/` - 学习路径
+详细验收证据见
+[需求与验收清单](docs/roadmap/resume-target-requirements.md)；真实平台演练步骤见
+[Durable Delivery 部署验收](docs/roadmap/delivery-sandbox-acceptance.md)。
 
-10 个递进式教学文件，每章增加一个核心概念：
+## 核心能力
 
-```sh
-uv sync
-cp .env.example .env
-# 编辑 .env: 设置 ANTHROPIC_API_KEY
+- 多渠道 Gateway：CLI、WebSocket、Telegram、飞书/Lark、企业微信、钉钉和 WeCom CLI。
+- Identity/Session：账号、渠道、用户隔离，显式 Link/Unlink/Merge，版本化 Session Policy。
+- Interaction State：任务持久化、revision、进度、取消、暂停、修改、恢复和中断恢复。
+- 安全交互：结构化澄清，高风险工具签名确认，授权与精确参数绑定且仅消费一次。
+- Tool Recovery：错误分类、只读/幂等安全重试、权限确认、部分副作用转人工处理。
+- Durable Delivery：SQLite、Lane Sequence、Lease、FIFO、ACK、Retry Wait、Dead Letter。
+- 渠道化呈现：Capability Registry、内容感知分片、卡片/附件降级、Semantic Snapshot。
+- 主动通知：Heartbeat、Cron、Reminder 统一经过订阅、静默、频控、去重和 Digest 策略。
+- 可观测与评测：append-only Trace、Artifact、反馈/Bad Case、Replay Case 和回归报告。
 
-python sessions/zh/s01_agent_loop.py       # Agent 循环
-python sessions/zh/s02_tool_use.py        # + 工具调用
-python sessions/zh/s03_sessions.py          # + 会话持久化
-python sessions/zh/s04_channels.py         # + 渠道适配
-python sessions/zh/s05_gateway_routing.py  # + 网关路由
-python sessions/zh/s06_intelligence.py      # + 智能系统
-python sessions/zh/s07_heartbeat_cron.py   # + 心跳 & Cron
-python sessions/zh/s08_delivery.py         # + 可靠投递
-python sessions/zh/s09_resilience.py        # + 容错弹性
-python sessions/zh/s10_concurrency.py       # + 并发控制
-```
+## 快速开始
 
-### 2. `src/tinyclaw/` - 生产项目
+### 1. 安装
 
-完成学习路径后，可使用 `src/tinyclaw/` 下的生产级代码：
+要求 Python 3.10+，推荐使用 [uv](https://docs.astral.sh/uv/)：
 
-```
-src/tinyclaw/
-├── config.py           # .env 配置加载
-├── client.py           # Anthropic client 工厂
-├── utils/              # 工具函数 (ANSI 颜色等)
-├── agent/              # Agent 循环 + 工具分发
-├── session/            # 会话持久化 + 上下文保护
-├── channel/            # 渠道适配器 (CLI / Telegram / Feishu)
-├── gateway/            # 5 层路由 + WebSocket 网关
-├── intelligence/       # Soul / Memory / Skills / 8 层 Prompt
-├── scheduler/          # 心跳 + Cron 调度
-├── delivery/           # WAL 投递队列
-├── resilience/         # 3 层重试 + Auth 轮换
-└── concurrency/        # 命名 Lane 并发控制
-```
-
----
-
-## 快速开始 (生产项目)
-
-```sh
-# 使用 uv 构建环境
-uv sync
-
-# 配置
-cp .env.example .env
-# 编辑 .env:
-#   ANTHROPIC_API_KEY=sk-ant-xxxxx
-#   MODEL_ID=claude-sonnet-4-20250514
-
-# 查看帮助
-python main.py --help
-
-# 两个运行入口:
-python main.py --mode cli                  # 纯 CLI 交互
-python main.py --mode server               # 飞书/网关服务模式
-python main.py --mode server --port 8877   # 自定义 Gateway 端口
-```
-
-### CLI 模式特性
-
-- 本地 REPL 对话
-- 命令查看系统状态（/status /cron /queue /lanes）
-- 适合本地调试与演示
-
-### Server 模式特性
-
-- 命名 Lane (main / cron / heartbeat)，FIFO 队列
-- WAL 写前日志投递队列，指数退避重试
-- 3 层重试：Auth 轮换 → 上下文压缩 → 工具调用循环
-- System Prompt 静态前缀缓存 + Anthropic prompt caching (cache_control)
-- 会话消息内存缓存 — 热路径零磁盘读取，仅冷启动加载
-- 心跳主动检查 (仅在活跃时段运行)
-- Cron 调度器 (at / every / cron 表达式)
-- 混合记忆搜索 (TF-IDF + 模拟向量)
-- 8 层 System Prompt 动态组装（静态前缀 + 动态后缀分离）
-- Skills 技能发现
-
-### Gateway API
-
-```sh
-# 启动服务模式并暴露 WebSocket 网关
-python main.py --mode server --port 8765
-
-# JSON-RPC 2.0 接口:
-# ws://localhost:8765
-
-# 发送消息:
-{"jsonrpc": "2.0", "method": "send", "params": {"text": "你好!"}, "id": 1}
-
-# 列出 agents:
-{"jsonrpc": "2.0", "method": "agents.list", "params": {}, "id": 2}
-
-# 查看路由 bindings:
-{"jsonrpc": "2.0", "method": "bindings.list", "params": {}, "id": 3}
-```
-
----
-
-## 架构 (生产项目)
-
-```
-tinyClaw
-├── agent/         while True + stop_reason (Agent 循环)
-│                  schema + handler (工具分发)
-├── session/       JSONL 持久化 (Session Store)
-│                  3 阶段上下文溢出保护 (Context Guard)
-├── channel/       InboundMessage 抽象
-│                  Telegram 长轮询 / Feishu Webhook
-├── gateway/       5 层 Binding 表 (路由)
-│                  WebSocket + JSON-RPC 2.0
-├── intelligence/  soul / memory / skills / 8 层 prompt
-├── scheduler/     Heartbeat (主动检查)
-│                  Cron (at/every/cron 表达式)
-├── delivery/      WAL 队列 + 后台投递
-├── resilience/    Auth Profile 轮换
-│                  3 层重试洋葱
-└── concurrency/  命名 FIFO Lane (generation 追踪)
-```
-
----
-
-## 章节依赖关系
-
-```
-s01 --> s02 --> s03 --> s04 --> s05
-                 |               |
-                 v               v
-                s06 ----------> s07 --> s08
-                 |               |
-                 v               v
-                s09 ----------> s10
-```
-
-| 章节 | 核心概念 | 行数 |
-|------|----------|------|
-| s01 | Agent 循环 = while + stop_reason | ~175 |
-| s02 | 工具 = schema dict + handler map | ~445 |
-| s03 | JSONL 持久化，超限摘要压缩 | ~890 |
-| s04 | 所有平台都产生相同的 InboundMessage | ~780 |
-| s05 | Binding 表映射 (channel, peer) 到 agent | ~625 |
-| s06 | System prompt = 磁盘文件，切换即换人格 | ~750 |
-| s07 | 定时线程 + 队列 | ~660 |
-| s08 | 写磁盘优先，崩溃不丢消息 | ~870 |
-| s09 | 3 层重试洋葱 + Auth 轮换 | ~1130 |
-| s10 | 命名 Lane + FIFO 队列 | ~900 |
-
----
-
-## 配置 (.env)
-
-```sh
-# LLM (必需)
-ANTHROPIC_API_KEY=sk-ant-xxxxx
-MODEL_ID=claude-sonnet-4-20250514
-
-# 自定义 API 端点 (可选，见下方「第三方 API 接入」)
-# ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
-
-# Telegram (可选)
-# TELEGRAM_BOT_TOKEN=123456:ABC-DEF
-# TELEGRAM_ALLOWED_CHATS=12345,67890
-
-# Feishu/Lark (可选，见下方「飞书接入」)
-# FEISHU_APP_ID=cli_xxxxxxxx
-# FEISHU_APP_SECRET=xxxxxxxx
-# FEISHU_IS_LARK=true
-
-# Work WeChat 智能机器人 (可选，见下方「企业微信接入」)
-# WORKWECHAT_MODE=long
-# WORKWECHAT_BOT_ID=AIBOTID
-# WORKWECHAT_BOT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# WORKWECHAT_WS_URL=wss://openws.work.weixin.qq.com
-# WORKWECHAT_PING_INTERVAL_SEC=30
-
-# DingTalk (可选，见下方「钉钉接入」)
-# DINGTALK_MODE=long
-# DINGTALK_CLIENT_ID=dingxxxxxxxxxxxxxxxx
-# DINGTALK_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# DINGTALK_ACCESS_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
-# DINGTALK_SECRET=SECxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# DINGTALK_WEBHOOK_HOST=0.0.0.0
-# DINGTALK_WEBHOOK_PORT=8768
-# DINGTALK_WEBHOOK_PATH=/dingtalk/events
-
-# WeCom CLI (可选)
-# WECOM_CLI_TOOL_ENABLED=true      # 让模型可调用 wecom-cli 工具
-# WECOM_CLI_POLL_ENABLED=false     # 是否把 wecom-cli 作为入站轮询通道
-# WECOM_CLI_ENABLED=true            # 兼容旧配置（等价同时开启 tool + poll）
-# WECOM_CLI_BIN=wecom-cli
-
-# 心跳 (可选)
-# HEARTBEAT_INTERVAL=1800
-# HEARTBEAT_ACTIVE_START=9
-# HEARTBEAT_ACTIVE_END=22
-```
-
----
-
-## 第三方 API 接入
-
-支持接入任何兼容 Anthropic `messages.create()` 格式的 API 提供商，通过 `ANTHROPIC_BASE_URL` 配置：
-
-### OpenRouter
-
-```sh
-ANTHROPIC_API_KEY=sk-or-v1-xxxxx
-ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
-MODEL_ID=anthropic/claude-3.5-sonnet
-```
-
-### Groq
-
-```sh
-ANTHROPIC_API_KEY=gsk_xxxxx
-ANTHROPIC_BASE_URL=https://api.groq.com/openai/v1
-MODEL_ID=llama-3.1-70b-versatile
-```
-
-### 其他兼容厂商
-
-只要支持以下格式即可无需修改代码：
-- `POST /v1/messages` 接口
-- `messages.create(model=, system=, messages=, tools=, max_tokens=)`
-- `stop_reason` 包含 `end_turn` 或 `tool_use`
-
----
-
-## 飞书接入
-
-### Step 1: 创建飞书应用
-
-1. 打开 [飞书开放平台](https://open.feishu.cn/app) → 创建「企业自建应用」
-2. 在「添加应用能力」中选择「机器人」
-3. 在「凭证与基础信息」获取 `App ID` 和 `App Secret`
-
-### Step 2: 配置事件订阅
-
-1. 进入「事件订阅」→ 启用「使用长连接接收事件」（简化部署）
-2. 添加事件：`im.message.receive_v1`（接收消息）
-3. 添加权限：`im:message`（读取消息）
-
-### Step 3: 配置环境变量
-
-```sh
-# .env
-FEISHU_APP_ID=cli_xxxxxxxx
-FEISHU_APP_SECRET=xxxxxxxx
-FEISHU_IS_LARK=false   # true = Lark 国际版, false = 飞书
-FEISHU_MODE=long       # long | webhook | both | off
-
-# 仅 webhook/both 需要
-FEISHU_WEBHOOK_HOST=0.0.0.0
-FEISHU_WEBHOOK_PORT=8766
-FEISHU_WEBHOOK_PATH=/feishu/events
-```
-
-### Step 4: 运行
-
-```sh
-# 长连接（无需 ngrok）
-python main.py --mode server
-
-# webhook（需要公网回调，可配 ngrok）
-# FEISHU_MODE=webhook 或 both
-python main.py --mode server
-```
-
-飞书长连接模式无需 ngrok，飞书 SDK 会主动连接到飞书服务器。
-
-当使用 webhook/both 时，本地测试可用 ngrok：
-
-```sh
-ngrok http 8766
-```
-
-然后在飞书事件订阅中配置：
-
-```text
-https://<your-ngrok-domain>/feishu/events
-```
-
----
-
-## 企业微信接入
-
-本项目已支持企业微信智能机器人两种接入模式：
-
-- long：官方长连接（推荐）
-- webhook：短连接桥接（用于已有网关/CLI 桥接场景）
-
-官方文档参考：
-- https://developer.work.weixin.qq.com/document/path/101463
-
-### 长连接模式（推荐）
-
-```sh
-# .env
-WORKWECHAT_MODE=long
-WORKWECHAT_BOT_ID=AIBOTID
-WORKWECHAT_BOT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-WORKWECHAT_WS_URL=wss://openws.work.weixin.qq.com
-WORKWECHAT_PING_INTERVAL_SEC=30
-```
-
-特点：
-
-- 无需公网回调地址
-- 无需处理 webhook 加解密
-- 低延迟，适合实时交互
-
-### Webhook 模式（桥接）
-
-```sh
-# .env
-WORKWECHAT_MODE=webhook
-WORKWECHAT_CORP_ID=wwxxxxxxxxxxxxxxxx
-WORKWECHAT_CORP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-WORKWECHAT_AGENT_ID=1000002
-WORKWECHAT_WEBHOOK_HOST=0.0.0.0
-WORKWECHAT_WEBHOOK_PORT=8767
-WORKWECHAT_WEBHOOK_PATH=/workwechat/events
-WORKWECHAT_WEBHOOK_TOKEN=change-me
-```
-
-说明：Webhook 模式当前接收标准化 JSON 事件，适合你已有企业微信 CLI/桥接进程时快速接入 tinyClaw。
-
----
-
-## 钉钉接入
-
-当前支持两种模式：
-
-- long：钉钉 Stream 长连接（推荐）
-- webhook：回调模式
-
-### 长连接模式（推荐）
-
-先安装依赖：
-
-```sh
-pip install dingtalk-stream
-```
-
-配置示例：
-
-```sh
-# .env
-DINGTALK_MODE=long
-DINGTALK_CLIENT_ID=dingxxxxxxxxxxxxxxxx
-DINGTALK_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# 出站发送可复用机器人 webhook 参数
-DINGTALK_ACCESS_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
-DINGTALK_SECRET=SECxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-### Webhook 模式
-
-- 入站：接收钉钉 webhook 回调
-- 出站：通过机器人 webhook 发送文本
-
-建议配置：
-
-```sh
-# .env
-DINGTALK_MODE=webhook
-DINGTALK_ACCESS_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
-DINGTALK_SECRET=SECxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-DINGTALK_WEBHOOK_HOST=0.0.0.0
-DINGTALK_WEBHOOK_PORT=8768
-DINGTALK_WEBHOOK_PATH=/dingtalk/events
-```
-
-如果你已经有完整 webhook URL，也可直接配置：
-
-```sh
-DINGTALK_WEBHOOK_URL=https://oapi.dingtalk.com/robot/send?access_token=xxxx
-```
-
-### WeCom CLI 工具模式（推荐与长连接配合）
-
-如果你的目标是“机器人身份回复 + 个人账号代操作”，建议：
-
-- 入站和机器人回复走 `WORKWECHAT_MODE=long`
-- `wecom-cli` 仅作为模型可调用工具，不作为入站轮询
-
-示例：
-
-```sh
-# .env
-WECOM_CLI_TOOL_ENABLED=true
-WECOM_CLI_POLL_ENABLED=false
-WECOM_CLI_BIN=wecom-cli
-```
-
-说明：
-
-- `WECOM_CLI_TOOL_ENABLED=true` 时，模型可以调用 wecom-cli 发送/查询
-- `WECOM_CLI_POLL_ENABLED=false` 时，不会把你个人账号消息轮询进来，避免“自己和自己对话”
-- 旧变量 `WECOM_CLI_ENABLED` 仍可用，等价于同时开启 tool 和 poll
-
----
-
-## Skills 与中文支持
-
-`workspace/skills/` 目录下的技能文件会被加载到 Agent 的 System Prompt 中。
-
-此外，tinyClaw 也会自动加载用户级 Skills 目录：
-
-- `~/.agents/skills`
-
-这意味着你安装在用户目录的官方 wecom-cli skills 也会被模型看到并利用其流程规范。
-
-### 中文环境优化
-
-建议在 `workspace/IDENTITY.md` 中明确指示 Agent 使用中文：
-
-```markdown
-你是一个友善、有帮助的 AI 助手。
-请始终使用中文回复。
-```
-
-### 创建中文 Skills
-
-在 `workspace/skills/` 下创建目录，放入 `SKILL.md`：
-
-```markdown
----
-name: 中文技能
-description: 一个中文技能示例
-invocation: /中文技能
----
-# 中文技能说明
-
-当用户调用此技能时，按以下方式执行...
-```
-
-### 注意事项
-
-- Skills 文件内容会被直接注入 System Prompt，确保中文编码为 UTF-8
-- `skills/example-skill/SKILL.md` 为占位示例，可替换或删除
-
----
-
-## 工作区文件
-
-`workspace/` 目录下的文件：
-
-| 文件 | 用途 |
-|------|------|
-| `SOUL.md` | Agent 个性 / 灵魂定义 |
-| `IDENTITY.md` | Agent 身份描述 |
-| `TOOLS.md` | 工具使用指南 |
-| `MEMORY.md` | 长期记忆 (常青内容) |
-| `USER.md` | 用户信息 |
-| `HEARTBEAT.md` | 心跳检查指令 |
-| `BOOTSTRAP.md` | 启动时加载的提示 |
-| `AGENTS.md` | 多 Agent 配置 |
-| `CRON.json` | Cron 任务配置 |
-| `skills/` | Skill 技能目录 |
-
----
-
-## 项目结构
-
-```
-tinyClaw/
-├── README.md              # 本文件
-├── .env.example           # 配置模板
-├── pyproject.toml         # 包配置 + 依赖 (uv)
-├── uv.lock                # 锁定依赖版本
-├── main.py                # CLI 入口
-├── src/tinyclaw/          # 生产级代码 (按功能模块划分)
-│   ├── __init__.py
-│   ├── __main__.py        # 支持 python -m tinyclaw
-│   ├── config.py
-│   ├── client.py
-│   ├── utils/
-│   ├── agent/
-│   ├── session/
-│   ├── channel/
-│   ├── gateway/
-│   ├── intelligence/
-│   ├── scheduler/
-│   ├── delivery/
-│   ├── resilience/
-│   └── concurrency/
-├── sessions/zh/          # 学习路径 (保留)
-│   ├── s01_agent_loop.py
-│   ├── s02_tool_use.py
-│   └── ... (10 个 .py + 10 个 .md)
-└── workspace/             # Agent 工作区
-    ├── SOUL.md
-    ├── TOOLS.md
-    ├── skills/
-    └── ...
-```
-
----
-
-## 环境要求
-
-- Python 3.10+
-- Anthropic API Key (或通过 `ANTHROPIC_BASE_URL` 配置兼容端点)
-
-## 环境要求
-
-- Python 3.10+
-- [uv](https://github.com/astral-sh/uv) (推荐) 或 pip
-- Anthropic API Key (或通过 `ANTHROPIC_BASE_URL` 配置兼容端点)
-
-## 依赖 (pyproject.toml)
-
-```sh
-# 使用 uv (推荐)
-uv sync
-
-# 开发依赖
+```bash
 uv sync --extra dev
+```
 
-# Telegram 支持 (可选)
+可选依赖：
+
+```bash
 uv sync --extra telegram
 ```
 
-核心依赖：anthropic, python-dotenv, websockets, croniter, httpx
+钉钉 Stream 长连接当前需要单独安装 `dingtalk-stream`；Webhook 模式不需要该依赖。
 
----
+### 2. 配置
 
-## License
+PowerShell：
 
-MIT
+```powershell
+Copy-Item .env.example .env
+```
+
+Linux/macOS：
+
+```bash
+cp .env.example .env
+```
+
+至少配置：
+
+```dotenv
+ANTHROPIC_API_KEY=your-api-key
+MODEL_ID=your-model-id
+```
+
+`ANTHROPIC_BASE_URL` 仅适用于实现 Anthropic Messages API 线协议的兼容端点。使用 Anthropic
+官方端点时保持未设置；不要把 OpenAI Chat Completions 端点直接填入。
+
+### 3. 运行
+
+CLI REPL：
+
+```bash
+uv run tinyclaw --mode cli
+```
+
+多渠道与 WebSocket Gateway：
+
+```bash
+uv run tinyclaw --mode server --host localhost --port 8765
+```
+
+也可以使用：
+
+```bash
+uv run python main.py --mode cli
+uv run python -m tinyclaw --mode server
+```
+
+支持的入口参数：
+
+| 参数 | 含义 | 默认值 |
+|---|---|---|
+| `--mode cli\|server` | CLI REPL 或多渠道服务 | `server` |
+| `--cli` | 等价于 `--mode cli` | 关闭 |
+| `--workspace PATH` | 运行数据与 Agent 工作区 | 仓库 `workspace/` |
+| `--env PATH` | 指定环境变量文件 | 当前目录 `.env` |
+| `--host HOST` | WebSocket Gateway 监听地址 | `localhost` |
+| `--port PORT` | WebSocket Gateway 端口 | `8765` |
+
+## CLI 交互与控制
+
+CLI 模式支持自然语言任务和以下控制命令：
+
+| 命令 | 用途 |
+|---|---|
+| `/status` | 模型、渠道、工具、心跳、投递和 Cron 状态 |
+| `/queue` / `/lanes` | Durable Delivery 与执行 Lane 状态 |
+| `/task status [id]` | 查看当前或指定任务 |
+| `/task cancel\|pause\|resume [id]` | 控制任务 |
+| `/task modify <id> <新目标>` | 修改暂停任务并保留 revision |
+| `/confirm approve\|deny <id> <token>` | 显式批准一次或拒绝高风险操作 |
+| `/clarify <id> field=value` | 回答结构化澄清问题 |
+| `/identity current` | 查看当前 Global Identity 与 Session Scope |
+| `/identity link\|unlink\|merge ...` | 显式管理身份关联并写审计记录 |
+| `/feedback up\|down\|correction [说明]` | 记录反馈并生成 Bad Case |
+| `/cron` / `/reminder` / `/memory` | 查看定时任务、提醒和记忆 |
+| `/trigger` | 立即触发 Heartbeat |
+
+同一 Session 的任务进入同一执行 Lane，严格串行；不同 Session 可并行。进程重启时，原
+`running`/`waiting` 任务会被标记为需要恢复，而不会被静默当作成功。
+
+## WebSocket JSON-RPC
+
+Server 模式默认监听 `ws://localhost:8765`，支持：
+
+- `send`
+- `bindings.set` / `bindings.list`
+- `agents.list`
+- `sessions.list`
+- `status`
+
+发送示例：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "send",
+  "params": {
+    "text": "生成一份项目状态摘要",
+    "channel": "websocket",
+    "account_id": "gateway",
+    "peer_id": "demo-client",
+    "platform_user_id": "demo-user"
+  },
+  "id": 1
+}
+```
+
+响应包含 `agent_id`、持久化 `session_key` 和最终 `reply`。请求同样经过 Identity Resolve、
+Task State、Session Lane 和 Tool Confirmation，不绕过生产交互链路。
+
+## 生产架构
+
+```text
+Inbound Adapter / WebSocket
+        ↓
+Binding Route → Global Identity → Versioned Session Policy
+        ↓
+Persistent Task + Interaction State
+        ↓
+Per-Session Execution Lane → Agent / Tool Recovery / Confirmation
+        ↓
+Outbound Intent → Capability Renderer → Semantic Snapshot
+        ↓
+SQLite Delivery Lane → Lease Worker → Channel Sender → ACK
+        ↓
+Trace / Artifact / Feedback → Replay Case → Regression Report
+```
+
+关键边界：
+
+- `InboundMessage` 是兼容 DTO，渠道边界可转换为版本化 `InboundEnvelope`。
+- Session 对话正文仍使用 append-only JSONL；身份、任务、确认、通知和投递使用 SQLite。
+- 发送适配器返回平台消息 ID 时记录 `acked`；仅确认“请求已接受”时记录
+  `accepted_unconfirmed`。
+- 支持客户端幂等键的平台使用 `idempotent_retry`；其他平台明确为
+  `at_least_once`，不宣称无法证明的 Exactly Once。
+- 旧 `workspace/delivery-queue/` 文件只作为迁移源保留；生产投递主存储是
+  `workspace/delivery.db`。
+
+## 工作区与持久化数据
+
+默认工作区为 `workspace/`：
+
+| 路径 | 内容 |
+|---|---|
+| `.sessions/agents/main/sessions/` | append-only 会话 JSONL |
+| `identity.db` | Global Identity、渠道关联、Session Scope 审计 |
+| `interaction.db` | Task、状态事件、澄清与确认请求 |
+| `interaction-artifacts/` | 任务结果和恢复 Artifact |
+| `delivery.db` | Delivery Lane、Sequence、Lease、ACK、Dead Letter |
+| `notifications.db` | 订阅、抑制原因、频控和去重预留 |
+| `feedback.db` | 用户反馈、Bad Case 和人工 revision |
+| `observability/` | Trace 分区、Annotation 和大型 Artifact |
+| `CRON.json` | Cron 配置 |
+| `SOUL.md` / `IDENTITY.md` / `TOOLS.md` | Agent Prompt 与工具说明 |
+| `memory/` / `skills/` | 长期记忆与技能 |
+
+切换 `SESSION_SCOPE` 时应同步递增 `SESSION_SCOPE_VERSION`，避免历史上下文被静默串联。
+可选值：
+
+- `per-peer`
+- `per-channel-peer`
+- `per-account-channel-peer`（默认，隔离最严格）
+- `linked-global-user`（仅显式关联后跨渠道共享）
+
+`CONFIRMATION_TOKEN_SECRET` 可显式提供；未配置时会在工作区生成并复用稳定密钥。
+
+## 渠道配置
+
+完整变量与默认值以 [.env.example](.env.example) 和
+[`load_config`](src/tinyclaw/config.py) 为准。
+
+| 渠道 | 模式 | 关键配置 |
+|---|---|---|
+| Telegram | polling | `TELEGRAM_BOT_TOKEN`、`TELEGRAM_ALLOWED_CHATS` |
+| 飞书/Lark | `long` / `webhook` / `both` / `off` | `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_MODE` |
+| 企业微信 | `long` / `webhook` / `off` | `WORKWECHAT_BOT_ID/SECRET` 或 `CORP_ID/SECRET` |
+| 钉钉 | `long` / `webhook` / `off` | `DINGTALK_CLIENT_ID/SECRET` 或 webhook 配置 |
+| WeCom CLI | Tool 与 Poll 独立开关 | `WECOM_CLI_TOOL_ENABLED`、`WECOM_CLI_POLL_ENABLED` |
+
+企业微信的具体接线、长连接回包和 WeCom CLI 能力见
+[企业微信实现解析](docs/wecom-channel-cli-skills-deep-dive.md)。
+
+## 可靠投递验收
+
+默认安全的离线演练不会读取渠道密钥，也不会发送真实消息：
+
+```bash
+uv run python -m tinyclaw.delivery.acceptance --output delivery-drill-report.json
+```
+
+覆盖场景：
+
+- Claim 后崩溃与 Lease 恢复。
+- 发送成功、Store settle 前崩溃。
+- 幂等平台重试去重。
+- 非幂等平台 At-Least-Once 重复风险。
+- 队首 Retry Wait 期间保持 FIFO。
+
+真实平台演练可能产生外部消息或重复消息，必须使用专用测试账号和目标，按
+[沙箱演练手册](docs/roadmap/delivery-sandbox-acceptance.md)执行。
+
+## 开发与验证
+
+```bash
+uv run pytest -q
+uv run ruff check main.py src tests
+uv run ruff format --check main.py src tests
+```
+
+截至 2026-08-03，前述测试为 109 项全通过；两个全量 Ruff 命令用于暴露和逐步清理历史
+基线，当前分别报告 20 条可修复 lint 诊断（`I001` 12、`F401` 7、`F841` 1）和 26 个
+待格式化文件。不要把它们描述为已全绿，也不要通过忽略规则掩盖；本次涉及的 Python
+文件应单独保持 lint/format 通过。
+
+当前仓库的生产测试覆盖：
+
+- Identity/Session 隔离与并发。
+- Interaction State、原子 revision、Cancel/Modify/Resume。
+- Clarification/Confirmation 与高风险工具闸门。
+- Tool Error 分类与恢复决策。
+- SQLite Delivery、Lease、FIFO、ACK、迁移和崩溃窗口。
+- Capability Renderer、通知策略、Trace/Feedback/Replay。
+
+教学系列保留历史实现，不作为生产 Ruff 基线；生产修改应至少检查 `main.py`、`src/` 和
+`tests/`。
+
+## 项目结构
+
+```text
+tinyClaw/
+├── main.py
+├── pyproject.toml
+├── src/tinyclaw/
+│   ├── agent/           # Agent Loop 与工具分发
+│   ├── channel/         # 渠道 Adapter 与回执边界
+│   ├── concurrency/     # 命名执行 Lane
+│   ├── contracts/       # Envelope/Task/Delivery/Trace 版本化契约
+│   ├── delivery/        # SQLite Store、Renderer 接入、Lease Worker、演练 CLI
+│   ├── gateway/         # Binding Route 与 WebSocket JSON-RPC
+│   ├── identity/        # Global Identity 与 Session Resolve
+│   ├── interaction/     # Task State、Control、Clarification、Confirmation
+│   ├── notification/    # 主动通知策略与 Gateway
+│   ├── observability/   # Trace、Artifact、Feedback/Bad Case
+│   ├── presentation/    # Channel Capability 与 Renderer
+│   ├── replay/          # Replay Case、Evaluator 与报告
+│   ├── resilience/      # 模型与工具恢复
+│   ├── runtime/         # Runtime Port 与 Tool Executor
+│   ├── scheduler/       # Heartbeat 与 Cron
+│   └── session/         # JSONL Session Store
+├── tests/               # 生产自动化测试
+├── docs/roadmap/        # 需求、架构、验收与沙箱演练
+├── sessions/zh/         # 教学系列（与生产实现解耦）
+└── workspace/           # 默认运行工作区
+```
+
+## 文档导航
+
+- [目标需求与最终验收](docs/roadmap/resume-target-requirements.md)
+- [目标/落地架构](docs/roadmap/resume-target-architecture.md)
+- [可靠投递部署验收](docs/roadmap/delivery-sandbox-acceptance.md)
+- [企业微信 Channel 与 WeCom CLI](docs/wecom-channel-cli-skills-deep-dive.md)
+
+## 已知边界
+
+- 真实飞书、企业微信、钉钉和 Telegram 平台故障演练尚需专用沙箱凭据与测试目标。
+- 非幂等平台在“平台已接受但本地未 settle”窗口只能保证 At-Least-Once。
+- 默认 Replay Executor 使用录制 observation；Live Replay 需要注入真实 `ReplayExecutor`。
+- 对正在执行且不可中断的模型/工具调用，取消是协作式的，会在下一个安全点生效。
+- 生产代码的全量 Ruff lint/format 历史基线尚未清零，功能测试通过不代表静态检查全绿。
+- 仓库当前未附独立 `LICENSE` 文件；对外分发前需要明确许可证。

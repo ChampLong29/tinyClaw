@@ -1,7 +1,7 @@
 # tinyClaw 企业微信 Channel 与官方 CLI Skills 深度实现解析
 
-> 更新时间：2026-04-02  
-> 适用代码版本：当前仓库 `main.py` + `src/tinyclaw/channel/*` + `src/tinyclaw/intelligence/*`
+> 更新时间：2026-08-03
+> 适用代码版本：当前仓库 `main.py` + `src/tinyclaw/channel/*` + Identity/Interaction/Delivery 生产链路
 
 ---
 
@@ -44,7 +44,7 @@
   - 注册 `wecom_cli_send_message` 工具
   - 初始化各 channel，注册路由 binding
   - poll/webhook/long-connection 的线程与循环
-  - 入站处理、调用 Agent、分片后出站投递
+  - 入站 Identity/Session 解析、Task 持久化、会话 Lane 与 Durable Delivery
 
 ### 2.4 配置
 
@@ -58,6 +58,13 @@
 - `src/tinyclaw/intelligence/prompt_builder.py`
   - 把 skills block 拼进系统提示词第 4 层
 
+### 2.6 生产交互与投递
+
+- `src/tinyclaw/identity/`：账号/渠道/用户身份解析与版本化 Session Boundary
+- `src/tinyclaw/interaction/`：Task State、控制命令、澄清与高风险确认
+- `src/tinyclaw/delivery/`：SQLite Delivery、Lane Sequence、Lease、ACK 和 Dead Letter
+- `src/tinyclaw/presentation/`：渠道 Capability、分片与降级渲染
+
 ---
 
 ## 3. 运行入口与企业微信接线流程
@@ -68,18 +75,18 @@
 
 在 `main.py` 中，当 `wecom_cli_tool_enabled` 为真时，注册工具 `wecom_cli_send_message`：
 
-- 位置：`main.py` 约 370 行
+- 位置：`run_app(...)` 的工具注册段
 - Schema 字段：`chat_type`、`chatid`、`content`
 - Handler：`_wecom_cli_send_message(...)`
 
 这意味着：
 
 - 模型在一轮对话里可直接发起工具调用，借助 `wecom-cli msg send_message` 主动发消息
-- 这是“工具层发送”，不等同于 Channel 的 `deliver_fn` 被动发送
+- 这是“工具层发送”，不等同于 Durable Delivery Worker 调用 Sender 的被动回复
 
 ## 3.2 wecomcli 轮询通道初始化
 
-- 位置：`main.py` 约 527 行
+- 位置：`run_app(...)` 的渠道初始化段
 - 条件：`wecom_cli_poll_enabled`
 - 初始化参数（从配置注入）：
   - `cli_bin`
@@ -91,11 +98,11 @@
 
 1. `ch_mgr.register(wecom_cli_channel)`
 2. `bindings.add(... match_value="wecomcli" ...)`
-3. 启动 `wecom_cli_poll_loop()` 线程（约 916 行）
+3. 启动 `wecom_cli_poll_loop()` 后台线程
 
 ## 3.3 workwechat 两种模式初始化
 
-- 位置：`main.py` 约 549 行开始
+- 位置：`run_app(...)` 的 Work WeChat 初始化段
 - 模式变量：`workwechat_mode`，仅允许 `long/webhook/off`
 
 ### long 模式
@@ -119,15 +126,17 @@
 1. 实例化 `WorkWeChatChannel`
 2. `ch_mgr.register(...)`
 3. `workwechat_sender = workwechat_channel`
-4. 在 `main.py` 约 1036 行，启动 `ThreadingHTTPServer`，用 `WorkWeChatWebhookHandler` 接收入站事件
+4. 在 server 启动阶段创建 `ThreadingHTTPServer`，用 `WorkWeChatWebhookHandler` 接收入站事件
 
-## 3.4 出站统一投递入口 deliver_fn
+## 3.4 出站统一耐久投递入口
 
-`deliver_fn` 在 `main.py` 约 744 行：
+`DurableDeliveryQueue` 先持久化 Outbound Intent 的渲染结果，`LeaseDeliveryWorker` 再调用
+`deliver_fn` 进入具体 Sender：
 
-- 针对不同 channel 分支调用对应 `.send()`
+- 针对不同 channel 分支调用对应 `.send_with_receipt()`
+- 透传 `delivery_id`、`idempotency_key`、`delivery_semantics` 和渲染元数据
 - workwechat 会透传 `reply_req_id`：
-  - `workwechat_sender.send(to, text, reply_req_id=...)`
+  - `workwechat_sender.send_with_receipt(to, text, reply_req_id=...)`
 
 这一点非常关键：
 
@@ -135,14 +144,17 @@
 
 ## 3.5 入站处理闭环
 
-`handle_inbound_message`（约 827 行）中：
+`handle_inbound_message(...)` 中：
 
 1. 从 `msg.raw` 抽取 `reply_req_id`
 2. 做渠道特定前置处理（如 workwechat `__workwechat_session_started__`）
 3. 路由到 agent (`resolve_route`)
-4. 执行 `run_turn(...)`
-5. 回复消息分片后 enqueue 到 delivery queue
-6. 对 workwechat 回复时继续透传 `reply_req_id`
+4. 解析 Global Identity 与版本化 Session Boundary
+5. 持久化 Task，并进入该 Session 的独立执行 Lane
+6. 通过 Production Interaction Service 执行 Agent/Tool、澄清和确认
+7. 最终结果经 Capability Renderer 进入 SQLite Durable Delivery
+8. 对 workwechat 回复继续透传 `reply_req_id`，并按平台回执记录 ACK 或
+   `accepted_unconfirmed`
 
 ---
 
@@ -152,7 +164,7 @@
 
 ## 4.1 输出解包 `_unwrap_cli_payload`
 
-函数：约 20 行
+函数：`_unwrap_cli_payload(...)`
 
 作用：
 
@@ -180,7 +192,7 @@
 
 ## 4.3 `poll`：窗口+分页+去重+类型兜底
 
-函数：约 150 行（核心）
+函数：`poll(...)`（核心）
 
 ### 时间窗口
 
@@ -221,7 +233,7 @@
 
 ## 4.4 `send`：分片发送
 
-函数：约 273 行
+函数：`send(...)`
 
 逻辑：
 
@@ -240,7 +252,7 @@
 - 发送成功/失败计数
 - 最近窗口时间、最近错误
 
-`main.py` 的 poll 线程会周期打印这些指标（约 916 行起）。
+`main.py` 的 `wecom_cli_poll_loop()` 会周期打印这些指标。
 
 ---
 
@@ -252,7 +264,7 @@
 
 ### Token 刷新
 
-函数：`_refresh_token`（约 53 行）
+函数：`_refresh_token(...)`
 
 - 调 `gettoken`
 - 缓存 `access_token` 与过期时间
@@ -260,14 +272,14 @@
 
 ### 发送分流
 
-函数：`send`（约 85 行）
+函数：`send(...)`
 
 - `chat:<id>` -> `/appchat/send`
 - `user:<id>` 或裸 ID -> `/message/send`
 
 ### 事件解析
 
-函数：`parse_event`（约 121 行）
+函数：`parse_event(...)`
 
 输入要求是“桥接层标准化 payload”：
 
@@ -337,7 +349,7 @@
 
 ### send 的 respond/send 双策略
 
-函数：`send`（约 394 行）
+函数：`send(...)`
 
 - 有 `reply_req_id`：发 `aibot_respond_msg`（回调语义回复）
 - 无 `reply_req_id`：发 `aibot_send_msg`（主动发送）
@@ -355,14 +367,14 @@ sequenceDiagram
   participant WC as wecom-cli
   participant Poll as WeComCliChannel.poll
   participant Q as inbound_queue
-  participant Agent as run_turn
-  participant DQ as DeliveryQueue
+  participant Task as InteractionService
+  participant DQ as DurableDeliveryQueue
 
   Poll->>WC: get_msg_chat_list(begin,end,cursor)
   Poll->>WC: get_message(chat_type,chatid,begin,end,cursor)
   Poll->>Q: put(InboundMessage)
-  Q->>Agent: handle_inbound_message
-  Agent->>DQ: enqueue(reply)
+  Q->>Task: identity resolve + persist task + session lane
+  Task->>DQ: render + SQLite enqueue(reply)
   DQ->>Poll: wecomcli.send(...)
   Poll->>WC: send_message(chat_type,chatid,text)
 ```
@@ -374,14 +386,14 @@ sequenceDiagram
   participant WW as WorkWeChat WS
   participant LC as WorkWeChatLongConnectionChannel
   participant Q as inbound_queue
-  participant Agent as run_turn
-  participant DQ as DeliveryQueue
+  participant Task as InteractionService
+  participant DQ as DurableDeliveryQueue
 
   LC->>WW: aibot_subscribe
   WW-->>LC: aibot_msg_callback(req_id,msg)
   LC->>Q: put(InboundMessage{raw.req_id})
-  Q->>Agent: handle_inbound_message
-  Agent->>DQ: enqueue(reply, meta.reply_req_id)
+  Q->>Task: identity resolve + persist task + session lane
+  Task->>DQ: render + SQLite enqueue(reply, meta.reply_req_id)
   DQ->>LC: send(to,text,reply_req_id)
   LC->>WW: aibot_respond_msg (or aibot_send_msg)
 ```
@@ -581,6 +593,11 @@ sequenceDiagram
 5. Work WeChat 长连接字段名兼容（多命名风格）
 6. body 多层嵌套兼容（`body` vs `data.body`）
 7. 回调 req_id 透传，优先使用 respond 命令回复
+8. 账号/渠道/用户参与 Identity 与 Session Boundary，默认不跨机器人串会话
+9. Task 先持久化再进入会话 Lane，同会话严格串行、不同会话并行
+10. SQLite Delivery 保存 Sequence、Lease、重试、Dead Letter 和平台回执
+11. 高风险工具使用精确 action digest 与一次性签名确认，不由普通聊天隐式批准
+12. Delivery 元数据明确区分 `idempotent_retry` 与 `at_least_once`
 
 ---
 
@@ -592,7 +609,7 @@ sequenceDiagram
 2. 再讲两条企业微信接入链：
    - wecomcli（轮询）
    - workwechat（webhook/长连接）
-3. 讲主流程闭环：入站 -> route -> run_turn -> delivery
+3. 讲主流程闭环：入站 -> identity/session -> task/lane -> runtime -> durable delivery
 4. 讲为什么要 skills：
    - 能力策略外置
    - 复杂业务流程可迭代
@@ -604,12 +621,12 @@ sequenceDiagram
 
 1. **统一指标上报**
    - 将 wecomcli health + workwechat ws 指标统一打到一个 metrics 接口
-2. **失败重试策略统一**
-   - 目前技能文档里有“最多重试三次”规则，代码层可抽象通用 retry policy
-3. **死信队列增强**
-   - 对持续失败的企业微信出站消息打标签（channel/peer/error），便于回放
-4. **协议测试样本库**
+2. **真实平台沙箱故障演练**
+   - 使用专用测试账号验证断网、Auth 过期和“平台接受但本地未 settle”窗口
+3. **协议测试样本库**
    - 把 workwechat 各类回调 payload 样本固化为测试夹具，防字段变更回归
+4. **平台原生富媒体能力**
+   - 在 Sender 真正支持后再开启卡片、按钮、文件上传等 Capability
 
 ---
 
@@ -618,15 +635,15 @@ sequenceDiagram
 - `src/tinyclaw/channel/base.py`
 - `src/tinyclaw/channel/wecom_cli.py`
 - `src/tinyclaw/channel/workwechat.py`
+- `src/tinyclaw/identity/`
+- `src/tinyclaw/interaction/production.py`
+- `src/tinyclaw/delivery/`
+- `src/tinyclaw/presentation/`
 - `src/tinyclaw/config.py`
 - `main.py`
 - `src/tinyclaw/intelligence/skills.py`
 - `src/tinyclaw/intelligence/prompt_builder.py`
 - `~/.agents/skills/wecomcli-*/SKILL.md`
 
----
-
-如果你希望，我可以在下一版文档里继续补两块：
-
-1. 按“故障场景”给出逐步排查手册（例如：收得到消息但发不出去、长连接反复重连、wecom-cli 返回包装异常）。
-2. 产出一份“面试问答版”附录（STAR 口径 + 追问答案 + 风险与优化）。
+部署前故障演练与验收记录格式见
+`docs/roadmap/delivery-sandbox-acceptance.md`。

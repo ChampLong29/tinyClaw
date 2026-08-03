@@ -1,13 +1,20 @@
 # TinyClaw 目标交互网关需求分析
 
-> 状态：目标态需求基线
-> 目标：在现有多渠道 Gateway 上补齐可恢复任务交互、可靠有序投递、渠道化呈现、主动通知治理和 Trace/Replay，使项目达到简历所描述的 Agent UX 能力。
+> 状态：已实现并通过自动化验收（2026-08-03）
+> 目标：在多渠道 Gateway 上提供可恢复任务交互、可靠有序投递、渠道化呈现、主动通知治理和 Trace/Replay。
+
+说明：这里的“验收”指下方 11 项功能验收和 109 项测试；生产目录的历史 Ruff
+lint/format 基线仍待单独机械清理，不计作功能未完成项。
 
 ## 1. 背景与成功标准
 
-当前项目已有 Channel Adapter、InboundMessage、Binding 路由、持久化 Global Identity、版本化 Session Policy、JSONL 会话、Prompt 分层、持久化 Task State、会话级执行 Lane、SQLite Delivery、失败重试，以及 Heartbeat 和 Cron。普通渠道、CLI 与 WebSocket 请求已按 Session Key 串行、跨 Session 并行；平台返回消息 ID 时记录 ACK，只接受请求但没有消息 ID 时显式记录 `accepted_unconfirmed`。
+当前项目已有 Channel Adapter、InboundMessage/InboundEnvelope、Binding 路由、持久化
+Global Identity、版本化 Session Policy、JSONL 会话、Prompt 分层、持久化 Task State、
+会话级执行 Lane、SQLite Delivery、失败恢复、NotificationPolicy，以及 Trace/Replay。
+普通渠道、CLI 与 WebSocket 请求按 Session Key 串行、跨 Session 并行；平台返回消息 ID
+时记录 ACK，只接受请求但没有消息 ID 时显式记录 `accepted_unconfirmed`。
 
-主要缺口：
+以下是本轮改造前的基线问题，现均已有对应实现和测试证据：
 
 - Agent 执行缺少统一 Interaction State。
 - 用户中断、取消、修改、继续、澄清与确认没有稳定协议。

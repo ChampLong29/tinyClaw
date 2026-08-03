@@ -653,12 +653,12 @@ Feedback、Bad Case、Replay Runner、Evaluator、回归报告。
 - ADR-06：Heartbeat/Cron/Reminder 统一经过 NotificationPolicy。
 - ADR-07：Trace 是事实流，Bad Case 和人工标签使用 Revision。
 
-## 20. 完成后的公开叙事
+## 20. 当前可验证的公开叙事
 
-完成 P0–P4 后，项目可以有证据地描述为：
+P0–P4 已完成自动化验收，项目可以有证据地描述为：
 
 - 统一多渠道身份、路由和可配置会话边界。
 - 以持久化 Interaction State 支持进度、中断、澄清、确认和恢复。
-- 以 WAL、Sequence、Lease、幂等键和 ACK 实现可恢复、有序的投递语义。
+- 以事务 SQLite、Sequence、Lease、幂等键和 ACK 实现可恢复、有序的投递语义。
 - 以 Channel Capability 提供卡片、文件和降级呈现，并治理主动通知。
 - 以完整 Trace 将失败与人工纠正转化为 Replay 和版本回归用例。
